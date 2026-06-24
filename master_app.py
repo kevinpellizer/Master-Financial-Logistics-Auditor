@@ -16,7 +16,7 @@ if not api_key:
 else:
     genai.configure(api_key=api_key)
 
-# Upgraded to the current active endpoint to fix the 404 error
+# Using current active fast endpoint
 model = genai.GenerativeModel('gemini-2.5-flash')
 
 st.title("📈 Master Logistics & Margin Auditor")
@@ -40,7 +40,6 @@ def standardize_country(val):
     for k, v in COUNTRY_MAP.items():
         if clean == v.upper() or clean == k: return v
         
-    # Robust Substring catching to prevent OSTALO dumps
     if any(x in clean for x in ['NEM', 'GER', 'DEU']): return 'Nemčija'
     if any(x in clean for x in ['ITA']): return 'Italija'
     if any(x in clean for x in ['SLO', 'SVN']): return 'Slovenija'
@@ -56,7 +55,6 @@ def standardize_country(val):
     return "OSTALO"
 
 def parse_financial_value(val):
-    """Safely extracts floats without multiplying by 100 if Pandas already parsed it."""
     if pd.isna(val): return 0.0
     if isinstance(val, (int, float)): return float(val)
     
@@ -115,7 +113,6 @@ if st.button("🚀 Execute Global Monthly Consolidation", type="primary", use_co
                 df_ltl = pd.read_csv(uploaded_ltl) if uploaded_ltl.name.endswith('.csv') else pd.read_excel(uploaded_ltl)
                 df_ltl.columns = [str(c).strip().lower() for c in df_ltl.columns]
                 
-                # Upgraded to catch "Država" with the special character
                 c_col = next((c for c in df_ltl.columns if any(x in c for x in ['country', 'drz', 'drž', 'dest'])), None)
                 m_col = next((c for c in df_ltl.columns if any(x in c for x in ['carrier', 'prevoznik'])), None)
                 v_col = next((c for c in df_ltl.columns if any(x in c for x in ['cost', 'cena', 'znesek', 'billed'])), None)
@@ -149,8 +146,13 @@ if st.button("🚀 Execute Global Monthly Consolidation", type="primary", use_co
                     file_bytes = file.getvalue()
                     response = model.generate_content([p, {"mime_type": file.type, "data": file_bytes}])
                     
-                    raw_text = response.text.replace("```json", "").replace("
-```", "").strip()
+                    # Safe multi-line string block extraction logic
+                    raw_text = response.text.strip()
+                    if "```json" in raw_text:
+                        raw_text = raw_text.split("```json")[1].split("```")[0].strip()
+                    elif "```" in raw_text:
+                        raw_text = raw_text.split("```")[1].split("```")[0].strip()
+                        
                     data = json.loads(raw_text)
                     
                     for s in data.get('shipments', []):
