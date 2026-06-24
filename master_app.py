@@ -148,8 +148,7 @@ if st.button("🚀 Execute Global Monthly Consolidation", type="primary", use_co
                     file_bytes = file.getvalue()
                     response = model.generate_content([p, {"mime_type": file.type, "data": file_bytes}])
                     
-                    raw_text = response.text.replace("```json", "").replace("
-```", "").strip()
+                    raw_text = response.text.replace("```json", "").replace("```", "").strip()
                     data = json.loads(raw_text)
                     
                     shipments = data.get('shipments', [])
