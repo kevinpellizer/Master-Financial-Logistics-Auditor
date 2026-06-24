@@ -5,6 +5,7 @@ import pandas as pd
 import json
 import time  
 from io import BytesIO
+import re
 import streamlit.components.v1 as components
 
 # --- 1. SETUP & CONFIGURATION ---
@@ -16,7 +17,6 @@ if not api_key:
 else:
     genai.configure(api_key=api_key)
 
-# Using current active fast endpoint
 model = genai.GenerativeModel('gemini-2.5-flash')
 
 st.title("📈 Master Logistics & Margin Auditor")
@@ -36,29 +36,37 @@ def standardize_country(val):
     if pd.isna(val): return "OSTALO"
     clean = str(val).strip().upper()
     
+    # 🚨 NEW: RegEx engine to catch all zip code spacing variations (ES28000, ES 28000, ES-28000)
+    match = re.match(r'^([A-Z]{2})[\s\-\_]*\d+', clean)
+    if match:
+        prefix = match.group(1)
+        if prefix in COUNTRY_MAP: return COUNTRY_MAP[prefix]
+
     if clean in COUNTRY_MAP: return COUNTRY_MAP[clean]
     for k, v in COUNTRY_MAP.items():
         if clean == v.upper() or clean == k: return v
         
-    if any(x in clean for x in ['NEM', 'GER', 'DEU']): return 'Nemčija'
-    if any(x in clean for x in ['ITA']): return 'Italija'
-    if any(x in clean for x in ['SLO', 'SVN']): return 'Slovenija'
-    if any(x in clean for x in ['FRA']): return 'Francija'
-    if any(x in clean for x in ['SPA', 'ESP', 'ŠPA']): return 'Španija'
-    if any(x in clean for x in ['NIZ', 'NED', 'NLD']): return 'Nizozemska'
-    if any(x in clean for x in ['BEL']): return 'Belgija'
-    if any(x in clean for x in ['LUK', 'LUX']): return 'Luksemburg'
-    if any(x in clean for x in ['SVI', 'ŠVI', 'CHE', 'CH']): return 'Švica'
-    if any(x in clean for x in ['HRV', 'CRO']): return 'Hrvaška'
+    # Aggressive Substring Matching (Slovenian + English variants)
+    if any(x in clean for x in ['NEM', 'GER', 'DEU', 'DE ']): return 'Nemčija'
+    if any(x in clean for x in ['ITA', 'ITALY', 'IT ']): return 'Italija'
+    if any(x in clean for x in ['SLO', 'SVN', 'SLOVENIA', 'SI ']): return 'Slovenija'
+    if any(x in clean for x in ['FRA', 'FRANCE', 'FR ']): return 'Francija'
+    if any(x in clean for x in ['SPA', 'ESP', 'SPAIN', 'ŠPA', 'ES ']): return 'Španija'
+    if any(x in clean for x in ['NIZ', 'NED', 'NLD', 'NETHERLANDS', 'NL ']): return 'Nizozemska'
+    if any(x in clean for x in ['BEL', 'BELGIUM', 'BE ']): return 'Belgija'
+    if any(x in clean for x in ['LUK', 'LUX', 'LUXEMBOURG', 'LU ']): return 'Luksemburg'
+    if any(x in clean for x in ['SVI', 'ŠVI', 'CHE', 'SWITZERLAND', 'CH ']): return 'Švica'
+    if any(x in clean for x in ['HRV', 'CRO', 'CROATIA', 'HR ']): return 'Hrvaška'
     if any(x in clean for x in ['KUV', 'KUW', 'KW']): return 'Kuwait (Oxygen)'
-    if any(x in clean for x in ['AVS', 'AUT', 'OST']): return 'Avstrija'
+    if any(x in clean for x in ['AVS', 'AUT', 'AUSTRIA', 'OST', 'AT ']): return 'Avstrija'
+    
     return "OSTALO"
 
 def parse_financial_value(val):
     if pd.isna(val): return 0.0
     if isinstance(val, (int, float)): return float(val)
     
-    clean_str = str(val).replace('€', '').strip()
+    clean_str = str(val).replace('€', '').replace(' ', '').replace('\xa0', '').strip()
     if not clean_str: return 0.0
     
     if '.' in clean_str and ',' in clean_str:
@@ -68,7 +76,11 @@ def parse_financial_value(val):
             clean_str = clean_str.replace(',', '')
     elif ',' in clean_str:
         clean_str = clean_str.replace(',', '.')
-        
+    elif '.' in clean_str:
+        parts = clean_str.split('.')
+        if len(parts) == 2 and len(parts[1]) == 3:
+            clean_str = clean_str.replace('.', '')
+            
     try:
         return float(clean_str)
     except:
@@ -88,7 +100,8 @@ if st.button("🚀 Execute Global Monthly Consolidation", type="primary", use_co
     all_shipment_rows = [] 
     revenue_dict = {name: 0.0 for name in COUNTRY_MAP.values()}
     revenue_dict["OSTALO"] = 0.0
-    
+    debug_log = []
+
     # --- STEP A: PROCESS REVENUE DATA ---
     if uploaded_revenue:
         with st.spinner("Parsing revenue matrices..."):
@@ -97,12 +110,13 @@ if st.button("🚀 Execute Global Monthly Consolidation", type="primary", use_co
                 df_rev.columns = [str(c).strip().lower() for c in df_rev.columns]
                 
                 c_col = next((c for c in df_rev.columns if any(x in c for x in ['country', 'drz', 'drž', 'mkt', 'code', 'kod'])), df_rev.columns[0])
-                v_col = next((c for c in df_rev.columns if any(x in c for x in ['revenue', 'promet', 'total', 'znesek'])), df_rev.columns[-1])
+                v_col = next((c for c in df_rev.columns if any(x in c for x in ['revenue', 'promet', 'total', 'znesek', 'neto', 'eur'])), df_rev.columns[-1])
+                
+                debug_log.append(f"✅ Revenue Sheet mapped - Country: [{c_col.upper()}], Value: [{v_col.upper()}]")
                 
                 for _, row in df_rev.iterrows():
                     ctry = standardize_country(row[c_col])
                     revenue_dict[ctry] += parse_financial_value(row[v_col])
-                st.toast("✅ Market revenue loaded successfully!")
             except Exception as e:
                 st.error(f"Error parsing Revenue sheet: {e}")
 
@@ -113,11 +127,13 @@ if st.button("🚀 Execute Global Monthly Consolidation", type="primary", use_co
                 df_ltl = pd.read_csv(uploaded_ltl) if uploaded_ltl.name.endswith('.csv') else pd.read_excel(uploaded_ltl)
                 df_ltl.columns = [str(c).strip().lower() for c in df_ltl.columns]
                 
-                c_col = next((c for c in df_ltl.columns if any(x in c for x in ['country', 'drz', 'drž', 'dest'])), None)
-                m_col = next((c for c in df_ltl.columns if any(x in c for x in ['carrier', 'prevoznik'])), None)
-                v_col = next((c for c in df_ltl.columns if any(x in c for x in ['cost', 'cena', 'znesek', 'billed'])), None)
+                c_col = next((c for c in df_ltl.columns if any(x in c for x in ['country', 'drz', 'drž', 'dest', 'kraj', 'trg'])), None)
+                m_col = next((c for c in df_ltl.columns if any(x in c for x in ['carrier', 'prevoznik', 'partner', 'dostava'])), None)
+                v_col = next((c for c in df_ltl.columns if any(x in c for x in ['cost', 'cena', 'znesek', 'billed', 'neto', 'eur', 'vrednost'])), None)
                 
                 if c_col and v_col:
+                    debug_log.append(f"✅ LTL Sheet mapped - Country: [{c_col.upper()}], Cost: [{v_col.upper()}], Carrier: [{m_col.upper() if m_col else 'NOT FOUND'}]")
+                    
                     for _, row in df_ltl.iterrows():
                         all_shipment_rows.append({
                             'country': standardize_country(row[c_col]),
@@ -125,9 +141,8 @@ if st.button("🚀 Execute Global Monthly Consolidation", type="primary", use_co
                             'cost': parse_financial_value(row[v_col]),
                             'source': uploaded_ltl.name
                         })
-                    st.toast("✅ Heavy LTL Freight entries safely merged!")
                 else:
-                    st.error("Could not dynamically map LTL columns. Check headers.")
+                    st.error("Could not dynamically map LTL columns. Ensure headers clearly contain terms like 'Country', 'Carrier', and 'Cost'.")
             except Exception as e:
                 st.error(f"Error parsing Heavy Freight sheet: {e}")
 
@@ -146,7 +161,6 @@ if st.button("🚀 Execute Global Monthly Consolidation", type="primary", use_co
                     file_bytes = file.getvalue()
                     response = model.generate_content([p, {"mime_type": file.type, "data": file_bytes}])
                     
-                    # Safe multi-line string block extraction logic
                     raw_text = response.text.strip()
                     if "```json" in raw_text:
                         raw_text = raw_text.split("```json")[1].split("```")[0].strip()
@@ -169,6 +183,11 @@ if st.button("🚀 Execute Global Monthly Consolidation", type="primary", use_co
 
     # --- 4. ENGINE MATH & CONSOLIDATION ---
     if all_shipment_rows:
+        if debug_log:
+            with st.expander("🛠️ Data Extraction Diagnostics (Check Mapped Columns)"):
+                for log_msg in debug_log:
+                    st.write(log_msg)
+                    
         df_master = pd.DataFrame(all_shipment_rows)
         country_costs = df_master.groupby('country')['cost'].sum().to_dict()
         carrier_costs = df_master.groupby('carrier')['cost'].sum().sort_values(ascending=False).to_dict()
