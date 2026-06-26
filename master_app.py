@@ -6,12 +6,13 @@ import json
 import time  
 from io import BytesIO
 import re
+import tempfile
 import streamlit.components.v1 as components
 
 # --- 1. SETUP & CONFIGURATION ---
 st.set_page_config(page_title="Master Logistics & Margin Auditor", layout="wide", page_icon="📈")
 
-# Session State initialization
+# Memory initialization so the dashboard doesn't disappear when you download
 if 'audit_success' not in st.session_state:
     st.session_state.audit_success = False
     st.session_state.processed_html = None
@@ -133,83 +134,85 @@ if st.button("🚀 Execute Global Monthly Consolidation", type="primary", use_co
                         })
             except Exception as e: st.error(f"LTL Error: {e}")
 
-    # --- C: COURIER INVOICES (API BLOCK BYPASS) ---
+    # --- C: COURIER INVOICES ---
     if uploaded_couriers and api_key:
         progress_bar = st.progress(0)
         
-        # 🚨 1. Use the most stable standard models available
-        model_flash = genai.GenerativeModel('gemini-1.5-flash')
-        model_pro = genai.GenerativeModel('gemini-1.5-pro')
+        # 🚨 STABLE MODEL - Preview models get deleted by Google and cause 403 errors
+        model = genai.GenerativeModel('gemini-1.5-flash')
         
-        # 🚨 2. TURN OFF SAFETY FILTERS: DHL invoices contain customer names, addresses, and tracking codes. 
-        # Google's API will block the request and return empty if it thinks you're scraping personal info.
-        safe = [
-            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
-        ]
-        
-        for idx, file in enumerate(uploaded_couriers):
-            with st.spinner(f"AI scanning: {file.name}..."):
+        for i, uploaded_file in enumerate(uploaded_couriers):
+            with st.spinner(f"Processing: {uploaded_file.name}..."):
                 try:
-                    p = (
-                        "Extract every single shipment line-by-line. Use ONLY these exact keys: 'tracking_nr', 'country', 'carrier', 'cost'. "
-                        "The 'cost' MUST be the TOTAL NET AMOUNT. EXCLUDE VAT/Taxes. "
-                        "Crucially, find the total net invoice amount at the bottom of the document and save it under the key 'invoice_net_total'. "
-                        "Return strictly as a single JSON object with a 'shipments' array."
-                    )
-                    file_bytes = file.getvalue()
-                    mime = "application/pdf" if file.name.lower().endswith(".pdf") else file.type
+                    p = "Extract every shipment line-by-line. Use ONLY these keys: 'tracking_nr', 'country', 'cost'. "
+                    p += "The 'country' MUST be the 2-letter destination code. "
+                    p += "CRITICAL FOR COST: The 'cost' MUST be the TOTAL NET AMOUNT for that specific shipment. "
+                    p += "You must ADD the base shipping rate PLUS all surcharges (fuel, remote area, handling, tolls, etc.) for that row. "
+                    p += "The invoice might be in English, Slovenian, German, or other languages. Understand the context of the columns. "
+                    p += "STRICTLY EXCLUDE any VAT / DDV / Tax from your math. Give me only the final net cost per shipment. "
+                    p += "Also find the total net invoice amount ('invoice_net_total'). Return as ONLY a JSON object."
+
+                    fb = uploaded_file.getvalue()
                     
-                    # Try Flash first for speed
-                    try:
-                        response = model_flash.generate_content([p, {"mime_type": mime, "data": file_bytes}], safety_settings=safe)
-                    except Exception:
-                        # Fallback to Pro
-                        response = model_pro.generate_content([p, {"mime_type": mime, "data": file_bytes}], safety_settings=safe)
-                    
-                    if not response.parts:
-                        raise ValueError("Google API blocked this PDF or returned an empty response.")
+                    # 🚨 BYPASS 403 FORBIDDEN ERROR USING SECURE FILE UPLOAD API
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                        tmp.write(fb)
+                        tmp_path = tmp.name
                         
-                    # 🚨 Safe, simple parsing
-                    raw_text = response.text.strip()
-                    start = raw_text.find('{')
-                    end = raw_text.rfind('}')
+                    try:
+                        # Upload securely to Google Servers
+                        ai_file = genai.upload_file(tmp_path, mime_type="application/pdf")
+                        
+                        # Analyze
+                        response = model.generate_content([p, ai_file])
+                        
+                        # Clean up Google Server
+                        genai.delete_file(ai_file.name)
+                    finally:
+                        # Clean up Local Server
+                        if os.path.exists(tmp_path):
+                            os.remove(tmp_path)
                     
-                    if start != -1 and end != -1:
-                        data = json.loads(raw_text[start:end+1])
-                    else:
-                        raise ValueError("No JSON found in AI response.")
+                    bt = chr(96) * 3
+                    raw = response.text.replace(bt + "json", "").replace(bt, "").strip()
+                    data = json.loads(raw)
                     
-                    # Math Reconciliation Logic
-                    file_net_total = parse_financial_value(str(data.get('invoice_net_total', 0)))
-                    file_extracted_sum = sum(parse_financial_value(str(s.get('cost', 0))) for s in data.get('shipments', []))
+                    shipments = data.get('shipments', [])
                     
+                    # Math Check Tracker
+                    file_net_total = float(data.get('invoice_net_total', 0))
+                    file_extracted_sum = 0.0
+                    
+                    carrier_name = uploaded_file.name.split('.')[0].upper()
+                    
+                    for s in shipments:
+                        row_cost = parse_financial_value(s.get('cost', 0))
+                        file_extracted_sum += row_cost
+                        
+                        all_shipment_rows.append({
+                            'country': standardize_country(s.get('country')),
+                            'carrier': carrier_name, 
+                            'cost': row_cost,
+                            'source': uploaded_file.name
+                        })
+                        
                     reconciliation_log.append({
-                        'file': file.name,
+                        'file': uploaded_file.name,
                         'invoice_total': file_net_total,
                         'extracted_sum': file_extracted_sum,
                         'diff': abs(file_net_total - file_extracted_sum)
                     })
-                    
-                    carrier_fallback = file.name.split('.')[0].upper()
-                    for s in data.get('shipments', []):
-                        all_shipment_rows.append({
-                            'country': standardize_country(s.get('country')),
-                            'carrier': str(s.get('carrier', carrier_fallback)).strip().upper(),
-                            'cost': parse_financial_value(str(s.get('cost', 0))),
-                            'source': file.name
-                        })
-                        
-                    # Standard pause
-                    if idx < len(uploaded_couriers) - 1: 
-                        time.sleep(4)
-                        
-                except Exception as e: 
-                    st.error(f"AI parsing failure on {file.name} - Reason: {str(e)}")
-                    
-            progress_bar.progress((idx + 1) / len(uploaded_couriers))
+
+                    if i < len(uploaded_couriers) - 1:
+                        time.sleep(15) 
+
+                except Exception as e:
+                    if "429" in str(e):
+                        st.error(f"Google Rate Limit hit on {uploaded_file.name}. Too many files too fast.")
+                    else:
+                        st.error(f"Error on {uploaded_file.name}: {e}")
+            
+            progress_bar.progress((i + 1) / len(uploaded_couriers))
 
     # --- 4. DATA CONSOLIDATION & HTML GENERATION ---
     if all_shipment_rows:
@@ -312,7 +315,7 @@ if st.button("🚀 Execute Global Monthly Consolidation", type="primary", use_co
         </body></html>
         """
         
-        # Store Everything in Memory so the buttons don't break the screen
+        # Store Everything in Memory
         out = BytesIO()
         with pd.ExcelWriter(out, engine='openpyxl') as writer:
             df_master.to_excel(writer, index=False, sheet_name='Master_Logistics_Ledger')
@@ -335,10 +338,10 @@ if st.session_state.get('audit_success', False):
             ext_total = rec['extracted_sum']
             diff = rec['diff']
             
-            if diff <= 1.00:
-                st.success(f"✅ **{file_name}**: Math checks out! (Net: €{inv_total:,.2f} | Added: €{ext_total:,.2f})")
+            if diff <= 0.10: 
+                st.success(f"✅ **{file_name}**: Match! (Invoice Net: €{inv_total:,.2f} | Rows Added: €{ext_total:,.2f})")
             else:
-                st.error(f"⚠️ **{file_name}**: Diff of €{diff:,.2f}! (Net: €{inv_total:,.2f} | Added: €{ext_total:,.2f})")
+                st.error(f"⚠️ **{file_name}**: Discrepancy of €{diff:,.2f}! (Invoice Net: €{inv_total:,.2f} | Rows Added: €{ext_total:,.2f})")
         st.divider()
 
     st.subheader("📊 Live Interactive Executive Dashboard")
