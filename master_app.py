@@ -11,7 +11,7 @@ import streamlit.components.v1 as components
 # --- 1. SETUP & CONFIGURATION ---
 st.set_page_config(page_title="Master Logistics & Margin Auditor", layout="wide", page_icon="📈")
 
-# Session State initialization
+# Memory initialization so the dashboard doesn't disappear when you download
 if 'audit_success' not in st.session_state:
     st.session_state.audit_success = False
     st.session_state.processed_html = None
@@ -23,6 +23,9 @@ if not api_key:
     st.warning("⚠️ GEMINI_API_KEY not found. Please set it in Render Environment Variables.")
 else:
     genai.configure(api_key=api_key)
+
+# 🚨 BACK TO THE WORKING MODEL FROM THIS MORNING
+model = genai.GenerativeModel('gemini-2.5-flash')
 
 st.title("📈 Master Logistics & Margin Auditor")
 st.markdown("Upload your monthly documents below to automatically generate your interactive financial dashboard.")
@@ -112,8 +115,7 @@ if st.button("🚀 Execute Global Monthly Consolidation", type="primary", use_co
                 v_col = next((c for c in df_rev.columns if any(x in c for x in ['revenue', 'promet', 'total', 'znesek', 'neto', 'eur'])), df_rev.columns[-1])
                 for _, row in df_rev.iterrows():
                     revenue_dict[standardize_country(row[c_col])] += parse_financial_value(row[v_col])
-            except Exception as e:
-                st.error(f"Revenue Error: {e}")
+            except Exception as e: st.error(f"Revenue Error: {e}")
 
     # --- B: LTL/FTL TRACKER ---
     if uploaded_ltl:
@@ -132,84 +134,60 @@ if st.button("🚀 Execute Global Monthly Consolidation", type="primary", use_co
                             'cost': parse_financial_value(row[v_col]),
                             'source': uploaded_ltl.name
                         })
-            except Exception as e:
-                st.error(f"LTL Error: {e}")
+            except Exception as e: st.error(f"LTL Error: {e}")
 
-    # --- C: COURIER INVOICES (GEMINI AI WITH 3-RETRY SELF-HEALING) ---
+    # --- C: COURIER INVOICES (SIMPLE & DIRECT) ---
     if uploaded_couriers and api_key:
         progress_bar = st.progress(0)
         for idx, file in enumerate(uploaded_couriers):
             with st.spinner(f"AI scanning: {file.name}..."):
-                
-                max_retries = 3
-                success = False
-                last_error = ""
-                
-                for attempt in range(max_retries):
-                    try:
-                        p = (
-                            "You are an expert logistics auditor. Extract every single shipment line-by-line from this invoice document. "
-                            "Return ONLY a valid JSON object. Do not include any conversational text. "
-                            "The JSON object must have exactly two root keys: "
-                            "1) 'invoice_net_total': a float representing the total net invoice amount usually found at the bottom of the document. "
-                            "2) 'shipments': a list of objects representing each individual shipment row. "
-                            "Each object inside 'shipments' MUST contain these exact keys: "
-                            "'tracking_nr' (string), 'country' (string, destination code), 'carrier' (string), 'cost' (float, total net amount for this row excluding VAT)."
-                        )
-                        file_bytes = file.getvalue()
-                        mime_type = file.type if file.type else "application/pdf"
-                        
-                        try:
-                            active_model = genai.GenerativeModel('gemini-1.5-flash')
-                            response = active_model.generate_content([p, {"mime_type": mime_type, "data": file_bytes}])
-                        except Exception:
-                            active_model = genai.GenerativeModel('gemini-1.5-pro')
-                            response = active_model.generate_content([p, {"mime_type": mime_type, "data": file_bytes}])
-
-                        if not response.parts:
-                            raise ValueError("AI returned an empty response.")
-                            
-                        # SAFEST POSSIBLE JSON EXTRACTION (No backticks used in string search)
-                        raw_text = response.text.strip()
-                        start_bracket = raw_text.find('{')
-                        end_bracket = raw_text.rfind('}')
-                        
-                        if start_bracket != -1 and end_bracket != -1:
-                            clean_json_string = raw_text[start_bracket:end_bracket+1]
-                            data = json.loads(clean_json_string)
-                        else:
-                            raise ValueError("Could not find curly brackets for JSON data.")
-                        
-                        # Math Reconciliation Logic
-                        file_net_total = parse_financial_value(str(data.get('invoice_net_total', 0)))
-                        file_extracted_sum = sum(parse_financial_value(str(s.get('cost', 0))) for s in data.get('shipments', []))
-                        reconciliation_log.append({
-                            'file': file.name,
-                            'invoice_total': file_net_total,
-                            'extracted_sum': file_extracted_sum,
-                            'diff': abs(file_net_total - file_extracted_sum)
+                try:
+                    p = (
+                        "Extract every single shipment line-by-line. Use ONLY these exact keys: 'tracking_nr', 'country', 'carrier', 'cost'. "
+                        "The 'cost' MUST be the TOTAL NET AMOUNT. EXCLUDE VAT/Taxes. "
+                        "Crucially, find the total net invoice amount at the bottom of the document and save it under the key 'invoice_net_total'. "
+                        "Return strictly as a single JSON object with a 'shipments' array."
+                    )
+                    file_bytes = file.getvalue()
+                    
+                    # 🚨 Direct call, exactly as it was when it worked
+                    response = model.generate_content([p, {"mime_type": file.type, "data": file_bytes}])
+                    
+                    # 🚨 Safe, simple parsing that won't break your chat/browser
+                    raw_text = response.text.strip()
+                    start = raw_text.find('{')
+                    end = raw_text.rfind('}')
+                    
+                    if start != -1 and end != -1:
+                        data = json.loads(raw_text[start:end+1])
+                    else:
+                        raise ValueError("No JSON found in AI response.")
+                    
+                    # Math Reconciliation Logic
+                    file_net_total = parse_financial_value(str(data.get('invoice_net_total', 0)))
+                    file_extracted_sum = sum(parse_financial_value(str(s.get('cost', 0))) for s in data.get('shipments', []))
+                    
+                    reconciliation_log.append({
+                        'file': file.name,
+                        'invoice_total': file_net_total,
+                        'extracted_sum': file_extracted_sum,
+                        'diff': abs(file_net_total - file_extracted_sum)
+                    })
+                    
+                    for s in data.get('shipments', []):
+                        all_shipment_rows.append({
+                            'country': standardize_country(s.get('country')),
+                            'carrier': str(s.get('carrier', file.name.split('.')[0])).strip().upper(),
+                            'cost': parse_financial_value(str(s.get('cost', 0))),
+                            'source': file.name
                         })
                         
-                        for s in data.get('shipments', []):
-                            all_shipment_rows.append({
-                                'country': standardize_country(s.get('country')),
-                                'carrier': str(s.get('carrier', file.name.split('.')[0])).strip().upper(),
-                                'cost': parse_financial_value(str(s.get('cost', 0))),
-                                'source': file.name
-                            })
-                            
-                        success = True
-                        break
-                            
-                    except Exception as e: 
-                        last_error = str(e)
-                        time.sleep(3)
-                
-                if not success:
-                    st.error(f"AI parsing failed completely on {file.name} after 3 attempts. Last error: {last_error}")
-                    
-                if idx < len(uploaded_couriers) - 1: 
-                    time.sleep(4)
+                    # Standard pause
+                    if idx < len(uploaded_couriers) - 1: 
+                        time.sleep(4)
+                        
+                except Exception as e: 
+                    st.error(f"AI parsing failure on {file.name} - Reason: {str(e)}")
                     
             progress_bar.progress((idx + 1) / len(uploaded_couriers))
 
@@ -226,13 +204,11 @@ if st.button("🚀 Execute Global Monthly Consolidation", type="primary", use_co
         ordered_countries = ["Nemčija", "Italija", "Slovenija", "Francija", "Kuwait (Oxygen)", "OSTALO", "Nizozemska", "Španija", "Belgija", "Švica", "Avstrija", "Hrvaška", "Luksemburg"]
         chart_rev_data = [round(revenue_dict.get(c, 0.0), 2) for c in ordered_countries]
         chart_log_data = [round(country_costs.get(c, 0.0), 2) for c in ordered_countries]
-        chart_carrier_labels = list(carrier_costs.keys())
-        chart_carrier_data = [round(v, 2) for v in carrier_costs.values()]
+        chart_carrier_labels, chart_carrier_data = list(carrier_costs.keys()), [round(v, 2) for v in carrier_costs.values()]
         
         table_rows_html = ""
         for c in ordered_countries:
-            rev = revenue_dict.get(c, 0.0)
-            log = country_costs.get(c, 0.0)
+            rev, log = revenue_dict.get(c, 0.0), country_costs.get(c, 0.0)
             pct = (log / rev * 100) if rev > 0 else 0.0
             badge = "badge-green" if pct < 10 else "badge-yellow" if pct < 20 else "badge-red"
             table_rows_html += f'<tr><td>{c}</td><td class="num-col">€{rev:,.2f}</td><td class="num-col">€{log:,.2f}</td><td class="num-col"><span class="{badge}">{pct:.2f}%</span></td></tr>'
@@ -314,6 +290,7 @@ if st.button("🚀 Execute Global Monthly Consolidation", type="primary", use_co
         </body></html>
         """
         
+        # Store Everything in Memory so the buttons don't break the screen
         out = BytesIO()
         with pd.ExcelWriter(out, engine='openpyxl') as writer:
             df_master.to_excel(writer, index=False, sheet_name='Master_Logistics_Ledger')
