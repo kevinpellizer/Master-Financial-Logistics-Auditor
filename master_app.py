@@ -6,7 +6,6 @@ import os
 import time
 from io import BytesIO
 import re
-import tempfile
 import streamlit.components.v1 as components
 
 # --- 1. SETUP & AUTH ---
@@ -42,23 +41,29 @@ def parse_financial_value(val):
     except: return 0.0
 
 def standardize_country(c):
-    if not c: return "OSTALO"
+    if not c or pd.isna(c): return "OSTALO"
     c = str(c).strip().upper()
     mapping = {
-        'IT': 'Italija', 'ITA': 'Italija', 'ITALY': 'Italija',
-        'SI': 'Slovenija', 'SVN': 'Slovenija', 'SLOVENIA': 'Slovenija',
-        'DE': 'Nemčija', 'DEU': 'Nemčija', 'GERMANY': 'Nemčija',
-        'FR': 'Francija', 'FRA': 'Francija', 'FRANCE': 'Francija',
-        'ES': 'Španija', 'ESP': 'Španija', 'SPAIN': 'Španija',
-        'NL': 'Nizozemska', 'NLD': 'Nizozemska', 'NETHERLANDS': 'Nizozemska',
-        'BE': 'Belgija', 'BEL': 'Belgija', 'BELGIUM': 'Belgija',
-        'CH': 'Švica', 'CHE': 'Švica', 'SWITZERLAND': 'Švica',
-        'AT': 'Avstrija', 'AUT': 'Avstrija', 'AUSTRIA': 'Avstrija',
-        'HR': 'Hrvaška', 'HRV': 'Hrvaška', 'CROATIA': 'Hrvaška',
-        'LU': 'Luksemburg', 'LUX': 'Luksemburg',
-        'KW': 'Kuwait (Oxygen)', 'KWT': 'Kuwait (Oxygen)'
+        'IT': 'Italija', 'ITA': 'Italija', 'ITALY': 'Italija', 'ITALIJA': 'Italija',
+        'SI': 'Slovenija', 'SVN': 'Slovenija', 'SLOVENIA': 'Slovenija', 'SLOVENIJA': 'Slovenija',
+        'DE': 'Nemčija', 'DEU': 'Nemčija', 'GERMANY': 'Nemčija', 'NEMČIJA': 'Nemčija', 'NEMCIJA': 'Nemčija',
+        'FR': 'Francija', 'FRA': 'Francija', 'FRANCE': 'Francija', 'FRANCIJA': 'Francija',
+        'ES': 'Španija', 'ESP': 'Španija', 'SPAIN': 'Španija', 'ŠPANIJA': 'Španija', 'SPANIJA': 'Španija',
+        'NL': 'Nizozemska', 'NLD': 'Nizozemska', 'NETHERLANDS': 'Nizozemska', 'NIZOZEMSKA': 'Nizozemska', 'HOLLAND': 'Nizozemska',
+        'BE': 'Belgija', 'BEL': 'Belgija', 'BELGIUM': 'Belgija', 'BELGIJA': 'Belgija',
+        'CH': 'Švica', 'CHE': 'Švica', 'SWITZERLAND': 'Švica', 'ŠVICA': 'Švica', 'SVICA': 'Švica',
+        'AT': 'Avstrija', 'AUT': 'Avstrija', 'AUSTRIA': 'Avstrija', 'AVSTRIJA': 'Avstrija',
+        'HR': 'Hrvaška', 'HRV': 'Hrvaška', 'CROATIA': 'Hrvaška', 'HRVAŠKA': 'Hrvaška', 'HRVASKA': 'Hrvaška',
+        'LU': 'Luksemburg', 'LUX': 'Luksemburg', 'LUXEMBOURG': 'Luksemburg', 'LUKSEMBURG': 'Luksemburg',
+        'KW': 'Kuwait (Oxygen)', 'KWT': 'Kuwait (Oxygen)', 'KUWAIT': 'Kuwait (Oxygen)', 'KUWAIT (OXYGEN)': 'Kuwait (Oxygen)'
     }
-    return mapping.get(c, "OSTALO")
+    # 1. Try exact match
+    if c in mapping: return mapping[c]
+    # 2. Try partial match (e.g., catching "DE - NEMČIJA")
+    for key, val in mapping.items():
+        if key in c or c in key: return val
+        
+    return "OSTALO"
 
 # --- 3. USER INTERFACE ---
 st.title("📈 Master Logistics & Margin Auditor")
@@ -118,7 +123,7 @@ if st.button("🚀 Execute Global Monthly Consolidation", type="primary", use_co
                         })
             except Exception as e: st.error(f"LTL Error: {e}")
 
-    # C. Process Courier PDFs via AI (Using Secure File Upload API)
+    # C. Process Courier PDFs via AI (Inline Memory Mode)
     if uploaded_couriers and api_token:
         progress_bar = st.progress(0)
         
@@ -131,8 +136,6 @@ if st.button("🚀 Execute Global Monthly Consolidation", type="primary", use_co
         
         for idx, file in enumerate(uploaded_couriers):
             with st.spinner(f"AI scanning: {file.name}..."):
-                tmp_path = None
-                ai_file = None
                 try:
                     prompt = """
                     Extract every shipment line-by-line. 
@@ -149,25 +152,19 @@ if st.button("🚀 Execute Global Monthly Consolidation", type="primary", use_co
                     }
                     """
                     
-                    # 1. Create a temporary physical file
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                        tmp.write(file.getvalue())
-                        tmp_path = tmp.name
+                    fb = file.getvalue()
+                    mime_type = "application/pdf" if file.name.lower().endswith(".pdf") else file.type
+                    if not mime_type: mime_type = "application/pdf"
                     
-                    # 2. Securely upload to Google's File API
-                    ai_file = genai.upload_file(tmp_path, mime_type="application/pdf")
-                    
-                    # 3. Request Generation targeting the uploaded file reference
-                    # Note: Removed generation_config to prevent mutually exclusive arguments error with safety_settings
+                    # Send data "inline" to bypass Google Cloud Drive permissions error
                     response = model.generate_content(
-                        [prompt, ai_file],
+                        [prompt, {"mime_type": mime_type, "data": fb}],
                         safety_settings=safety_settings
                     )
                     
-                    # 4. Clean the response manually
+                    # Clean the response manually (Stripping Markdown)
                     raw_text = response.text.strip()
-                    if raw_text.startswith("```"):
-                        raw_text = raw_text.replace("```json", "").replace("```", "").strip()
+                    raw_text = raw_text.replace("```json", "").replace("```", "").strip()
                         
                     data = json.loads(raw_text)
                     
@@ -196,13 +193,6 @@ if st.button("🚀 Execute Global Monthly Consolidation", type="primary", use_co
                         
                 except Exception as e:
                     st.error(f"AI parsing failure on {file.name}: {str(e)}")
-                finally:
-                    # Cleanup: Ensure Google's server and your server stay clean
-                    if ai_file:
-                        try: genai.delete_file(ai_file.name)
-                        except: pass
-                    if tmp_path and os.path.exists(tmp_path):
-                        os.remove(tmp_path)
                     
             progress_bar.progress((idx + 1) / len(uploaded_couriers))
 
@@ -233,7 +223,7 @@ if st.button("🚀 Execute Global Monthly Consolidation", type="primary", use_co
             top_5_html += f"<tr><td>{row['carrier']}<span class='client-tag'>{row['source'].replace('.xlsx','').replace('.csv','')}</span></td><td>{row['country']}</td><td class='cost-col'>€{row['cost']:,.2f}</td></tr>"
 
         html_dashboard_code = f"""
-        <!DOCTYPE html><html><head><script src="[https://cdn.jsdelivr.net/npm/chart.js](https://cdn.jsdelivr.net/npm/chart.js)"></script>
+        <!DOCTYPE html><html><head><script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
         <style>
             body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f1f5f9; color: #1e293b; margin:0; padding:40px; }}
             .dashboard {{ max-width: 1400px; margin: 0 auto; }}
@@ -322,7 +312,7 @@ if st.session_state.get('audit_success', False):
     if st.session_state.reconciliation_log:
         st.subheader("⚖️ AI Audit Verification (Math Check)")
         for rec in st.session_state.reconciliation_log:
-            # 🚨 NEW: Shortened variable names so the strings never break during copy/paste
+            # Shortened variable names so the strings never break during copy/paste
             file_name = rec['file']
             inv_total = rec['invoice_total']
             ext_total = rec['extracted_sum']
