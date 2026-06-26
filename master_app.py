@@ -112,7 +112,8 @@ if st.button("🚀 Execute Global Monthly Consolidation", type="primary", use_co
                 v_col = next((c for c in df_rev.columns if any(x in c for x in ['revenue', 'promet', 'total', 'znesek', 'neto', 'eur'])), df_rev.columns[-1])
                 for _, row in df_rev.iterrows():
                     revenue_dict[standardize_country(row[c_col])] += parse_financial_value(row[v_col])
-            except Exception as e: st.error(f"Revenue Error: {e}")
+            except Exception as e:
+                st.error(f"Revenue Error: {e}")
 
     # --- B: LTL/FTL TRACKER ---
     if uploaded_ltl:
@@ -131,7 +132,8 @@ if st.button("🚀 Execute Global Monthly Consolidation", type="primary", use_co
                             'cost': parse_financial_value(row[v_col]),
                             'source': uploaded_ltl.name
                         })
-            except Exception as e: st.error(f"LTL Error: {e}")
+            except Exception as e:
+                st.error(f"LTL Error: {e}")
 
     # --- C: COURIER INVOICES (GEMINI AI WITH 3-RETRY SELF-HEALING) ---
     if uploaded_couriers and api_key:
@@ -224,11 +226,13 @@ if st.button("🚀 Execute Global Monthly Consolidation", type="primary", use_co
         ordered_countries = ["Nemčija", "Italija", "Slovenija", "Francija", "Kuwait (Oxygen)", "OSTALO", "Nizozemska", "Španija", "Belgija", "Švica", "Avstrija", "Hrvaška", "Luksemburg"]
         chart_rev_data = [round(revenue_dict.get(c, 0.0), 2) for c in ordered_countries]
         chart_log_data = [round(country_costs.get(c, 0.0), 2) for c in ordered_countries]
-        chart_carrier_labels, chart_carrier_data = list(carrier_costs.keys()), [round(v, 2) for v in carrier_costs.values()]
+        chart_carrier_labels = list(carrier_costs.keys())
+        chart_carrier_data = [round(v, 2) for v in carrier_costs.values()]
         
         table_rows_html = ""
         for c in ordered_countries:
-            rev, log = revenue_dict.get(c, 0.0), country_costs.get(c, 0.0)
+            rev = revenue_dict.get(c, 0.0)
+            log = country_costs.get(c, 0.0)
             pct = (log / rev * 100) if rev > 0 else 0.0
             badge = "badge-green" if pct < 10 else "badge-yellow" if pct < 20 else "badge-red"
             table_rows_html += f'<tr><td>{c}</td><td class="num-col">€{rev:,.2f}</td><td class="num-col">€{log:,.2f}</td><td class="num-col"><span class="{badge}">{pct:.2f}%</span></td></tr>'
