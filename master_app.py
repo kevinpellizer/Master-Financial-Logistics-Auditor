@@ -146,20 +146,35 @@ if st.button("🚀 Execute Global Monthly Consolidation", type="primary", use_co
                         "Extract every single shipment line-by-line. Use ONLY these exact keys: 'tracking_nr', 'country', 'carrier', 'cost'. "
                         "The 'cost' MUST be the TOTAL NET AMOUNT. EXCLUDE VAT/Taxes. "
                         "Crucially, find the total net invoice amount at the bottom of the document and save it under the key 'invoice_net_total'. "
-                        "Return strictly as a single JSON object with a 'shipments' array."
+                        "Return strictly as a single JSON object with a 'shipments' array. "
+                        "CRITICAL INSTRUCTION: Do NOT use markdown formatting. Do NOT use backticks. Return ONLY pure raw JSON text."
                     )
                     file_bytes = file.getvalue()
                     
-                    # 🚨 Direct call, exactly as it was when it worked
-                    response = model.generate_content([p, {"mime_type": file.type, "data": file_bytes}])
+                    # Hardcode PDF mime_type in case Streamlit misses it (which causes instant API rejection)
+                    mime_type = "application/pdf" if file.name.lower().endswith(".pdf") else file.type
+                    if not mime_type: mime_type = "application/pdf"
                     
-                    # 🚨 Safe, simple parsing that won't break your chat/browser
-                    raw_text = response.text.strip()
+                    # 🚨 Direct call, exactly as it was when it worked
+                    response = model.generate_content([p, {"mime_type": mime_type, "data": file_bytes}])
+                    
+                    try:
+                        raw_text = response.text.strip()
+                    except Exception:
+                        raise ValueError("AI returned an empty response. The document might be unreadable.")
+                        
+                    # 🚨 Safe, bulletproof parsing
+                    bt = chr(96) * 3 # Mathematically strip markdown if AI disobeys
+                    raw_text = raw_text.replace(bt + "json", "").replace(bt, "").strip()
+                    
                     start = raw_text.find('{')
                     end = raw_text.rfind('}')
                     
                     if start != -1 and end != -1:
-                        data = json.loads(raw_text[start:end+1])
+                        try:
+                            data = json.loads(raw_text[start:end+1])
+                        except json.JSONDecodeError as jde:
+                            raise ValueError(f"AI returned corrupted JSON data: {str(jde)}")
                     else:
                         raise ValueError("No JSON found in AI response.")
                     
