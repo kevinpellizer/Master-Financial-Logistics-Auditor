@@ -11,13 +11,18 @@ import streamlit.components.v1 as components
 # --- 1. SETUP & CONFIGURATION ---
 st.set_page_config(page_title="Master Logistics & Margin Auditor", layout="wide", page_icon="📈")
 
+# 🚨 NEW: Session State initialization to prevent the dashboard from vanishing on download
+if 'audit_success' not in st.session_state:
+    st.session_state.audit_success = False
+    st.session_state.processed_html = None
+    st.session_state.processed_excel = None
+    st.session_state.reconciliation_log = None
+
 api_key = os.environ.get("GEMINI_API_KEY")
 if not api_key:
     st.warning("⚠️ GEMINI_API_KEY not found. Please set it in Render Environment Variables.")
 else:
     genai.configure(api_key=api_key)
-
-model = genai.GenerativeModel('gemini-2.5-flash')
 
 st.title("📈 Master Logistics & Margin Auditor")
 st.markdown("Upload your monthly documents below to automatically generate your interactive financial dashboard.")
@@ -95,8 +100,7 @@ if st.button("🚀 Execute Global Monthly Consolidation", type="primary", use_co
     all_shipment_rows = [] 
     revenue_dict = {name: 0.0 for name in COUNTRY_MAP.values()}
     revenue_dict["OSTALO"] = 0.0
-    debug_log = []
-    reconciliation_log = [] # Stores data for the Math Check
+    reconciliation_log = []
 
     # --- A: REVENUE DATA ---
     if uploaded_revenue:
@@ -136,24 +140,51 @@ if st.button("🚀 Execute Global Monthly Consolidation", type="primary", use_co
             with st.spinner(f"AI scanning: {file.name}..."):
                 try:
                     p = (
-                        "Extract every single shipment line-by-line. Use ONLY these exact keys: 'tracking_nr', 'country', 'carrier', 'cost'. "
-                        "The 'cost' MUST be the TOTAL NET AMOUNT. EXCLUDE VAT/Taxes. "
-                        "Crucially, find the total net invoice amount at the bottom of the document and save it under the key 'invoice_net_total'. "
-                        "Return strictly as a single JSON object."
+                        "You are an expert logistics auditor. Extract every single shipment line-by-line from this invoice document. "
+                        "Return ONLY a valid JSON object. Do not include any conversational text. "
+                        "The JSON object must have exactly two root keys: "
+                        "1) 'invoice_net_total': a float representing the total net invoice amount usually found at the bottom of the document. "
+                        "2) 'shipments': a list of objects representing each individual shipment row. "
+                        "Each object inside 'shipments' MUST contain these exact keys: "
+                        "'tracking_nr' (string), 'country' (string, destination code), 'carrier' (string), 'cost' (float, total net amount for this row excluding VAT)."
                     )
                     file_bytes = file.getvalue()
-                    response = model.generate_content([p, {"mime_type": file.type, "data": file_bytes}])
+                    mime_type = file.type if file.type else "application/pdf"
                     
-                    # Safe multi-line string block extraction logic (Avoids Markdown copy-paste bugs)
-                    raw_text = response.text.strip()
-                    marker = "`" * 3
-                    
-                    if marker + "json" in raw_text: 
-                        raw_text = raw_text.split(marker + "json")[1].split(marker)[0].strip()
-                    elif marker in raw_text: 
-                        raw_text = raw_text.split(marker)[1].split(marker)[0].strip()
+                    # 🚨 NEW: Smart Model Fallback System + Strict JSON Mode Enforced
+                    try:
+                        active_model = genai.GenerativeModel('gemini-1.5-pro-latest')
+                        response = active_model.generate_content(
+                            [p, {"mime_type": mime_type, "data": file_bytes}],
+                            generation_config=genai.GenerationConfig(response_mime_type="application/json")
+                        )
+                    except Exception as primary_error:
+                        # If Pro fails (e.g. 404 or quota), instantly swap to Flash
+                        active_model = genai.GenerativeModel('gemini-1.5-flash-latest')
+                        response = active_model.generate_content(
+                            [p, {"mime_type": mime_type, "data": file_bytes}],
+                            generation_config=genai.GenerationConfig(response_mime_type="application/json")
+                        )
+
+                    # Ensure we actually got a response
+                    if not response.parts:
+                        raise ValueError("AI blocked the request or returned an empty response.")
                         
-                    data = json.loads(raw_text)
+                    raw_text = response.text.strip()
+                    
+                    # Failsafe cleaner just in case the model ignores JSON strict mode
+                    if "```json" in raw_text: 
+                        raw_text = raw_text.split("```json")[1].split("```")[0].strip()
+                    elif "```" in raw_text: 
+                        raw_text = raw_text.split("```")[1].split("```")[0].strip()
+                    
+                    try:
+                        data = json.loads(raw_text)
+                    except json.JSONDecodeError:
+                        # Extreme fallback: locate boundaries manually
+                        start = raw_text.find('{')
+                        end = raw_text.rfind('}')
+                        data = json.loads(raw_text[start:end+1])
                     
                     # Math Reconciliation Logic
                     file_net_total = parse_financial_value(str(data.get('invoice_net_total', 0)))
@@ -172,24 +203,18 @@ if st.button("🚀 Execute Global Monthly Consolidation", type="primary", use_co
                             'cost': parse_financial_value(str(s.get('cost', 0))),
                             'source': file.name
                         })
-                    if idx < len(uploaded_couriers) - 1: time.sleep(4)
-                except Exception as e: st.error(f"AI parsing failure on {file.name}: {e}")
+                    
+                    # Crucial Anti-Spam API Pause
+                    if idx < len(uploaded_couriers) - 1: 
+                        time.sleep(5)
+                        
+                except Exception as e: 
+                    st.error(f"AI parsing failure on {file.name} - Reason: {str(e)}")
             progress_bar.progress((idx + 1) / len(uploaded_couriers))
 
     # --- 4. DATA CONSOLIDATION & HTML GENERATION ---
     if all_shipment_rows:
         df_master = pd.DataFrame(all_shipment_rows)
-        
-        # Visual Math Verification Dashboard
-        if reconciliation_log:
-            st.subheader("⚖️ AI Audit Verification (Math Check)")
-            for rec in reconciliation_log:
-                if rec['diff'] <= 1.00: # We allow a 1 euro tolerance for rounding
-                    st.success(f"✅ **{rec['file']}**: Math checks out! (Invoice Net: €{rec['invoice_total']:,.2f} | Rows Added: €{rec['extracted_sum']:,.2f})")
-                else:
-                    st.error(f"⚠️ **{rec['file']}**: Discrepancy of €{rec['diff']:,.2f}! (Invoice Net: €{rec['invoice_total']:,.2f} | Rows Added: €{rec['extracted_sum']:,.2f})")
-            st.divider()
-
         country_costs = df_master.groupby('country')['cost'].sum().to_dict()
         carrier_costs = df_master.groupby('carrier')['cost'].sum().sort_values(ascending=False).to_dict()
         
@@ -202,7 +227,6 @@ if st.button("🚀 Execute Global Monthly Consolidation", type="primary", use_co
         chart_log_data = [round(country_costs.get(c, 0.0), 2) for c in ordered_countries]
         chart_carrier_labels, chart_carrier_data = list(carrier_costs.keys()), [round(v, 2) for v in carrier_costs.values()]
         
-        # Build Left Margin Table
         table_rows_html = ""
         for c in ordered_countries:
             rev, log = revenue_dict.get(c, 0.0), country_costs.get(c, 0.0)
@@ -210,7 +234,6 @@ if st.button("🚀 Execute Global Monthly Consolidation", type="primary", use_co
             badge = "badge-green" if pct < 10 else "badge-yellow" if pct < 20 else "badge-red"
             table_rows_html += f'<tr><td>{c}</td><td class="num-col">€{rev:,.2f}</td><td class="num-col">€{log:,.2f}</td><td class="num-col"><span class="{badge}">{pct:.2f}%</span></td></tr>'
 
-        # Build Top 5 Projects Table (Right Side)
         top_5_html = ""
         top_5_df = df_master.nlargest(5, 'cost')
         for _, row in top_5_df.iterrows():
@@ -288,30 +311,50 @@ if st.button("🚀 Execute Global Monthly Consolidation", type="primary", use_co
         </body></html>
         """
         
-        st.subheader("📊 Live Interactive Executive Dashboard")
-        components.html(html_dashboard_code, height=950, scrolling=True)
-        
-        # Dual Export Buttons Side-by-Side
-        st.subheader("📥 Export Reports")
-        col_exp1, col_exp2 = st.columns(2)
-        
-        with col_exp1:
-            out = BytesIO()
-            with pd.ExcelWriter(out, engine='openpyxl') as writer:
-                df_master.to_excel(writer, index=False, sheet_name='Master_Logistics_Ledger')
-            st.download_button(
-                label="📁 Download Raw Excel Ledger",
-                data=out.getvalue(),
-                file_name="Verified_Monthly_Audit.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True
-            )
+        # Store Everything in Memory so the buttons don't break the screen
+        out = BytesIO()
+        with pd.ExcelWriter(out, engine='openpyxl') as writer:
+            df_master.to_excel(writer, index=False, sheet_name='Master_Logistics_Ledger')
             
-        with col_exp2:
-            st.download_button(
-                label="🌐 Download Trello HTML Dashboard",
-                data=html_dashboard_code.encode('utf-8'),
-                file_name="KingsBox_Monthly_Dashboard.html",
-                mime="text/html",
-                use_container_width=True
-            )
+        st.session_state.processed_html = html_dashboard_code
+        st.session_state.processed_excel = out.getvalue()
+        st.session_state.reconciliation_log = reconciliation_log
+        st.session_state.audit_success = True
+    else:
+        st.error("No valid shipment rows were extracted. Please check the logs.")
+
+# --- 5. RENDER THE SECURE DISPLAY LAYER ---
+if st.session_state.get('audit_success', False):
+    
+    if st.session_state.reconciliation_log:
+        st.subheader("⚖️ AI Audit Verification (Math Check)")
+        for rec in st.session_state.reconciliation_log:
+            if rec['diff'] <= 1.00:
+                st.success(f"✅ **{rec['file']}**: Math checks out! (Invoice Net: €{rec['invoice_total']:,.2f} | Rows Added: €{rec['extracted_sum']:,.2f})")
+            else:
+                st.error(f"⚠️ **{rec['file']}**: Discrepancy of €{rec['diff']:,.2f}! (Invoice Net: €{rec['invoice_total']:,.2f} | Rows Added: €{rec['extracted_sum']:,.2f})")
+        st.divider()
+
+    st.subheader("📊 Live Interactive Executive Dashboard")
+    components.html(st.session_state.processed_html, height=950, scrolling=True)
+    
+    st.subheader("📥 Export Reports")
+    col_exp1, col_exp2 = st.columns(2)
+    
+    with col_exp1:
+        st.download_button(
+            label="📁 Download Raw Excel Ledger",
+            data=st.session_state.processed_excel,
+            file_name="Verified_Monthly_Audit.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
+        )
+        
+    with col_exp2:
+        st.download_button(
+            label="🌐 Download Trello HTML Dashboard",
+            data=st.session_state.processed_html.encode('utf-8'),
+            file_name="KingsBox_Monthly_Dashboard.html",
+            mime="text/html",
+            use_container_width=True
+        )
