@@ -11,15 +11,8 @@ import streamlit.components.v1 as components
 # --- 1. SETUP & AUTH ---
 st.set_page_config(page_title="KingsBox Audit App", layout="wide", page_icon="📈")
 
-# Smart Authentication: Handles both AIza API keys and AQ OAuth tokens
 api_token = os.environ.get("GEMINI_API_KEY", "").strip()
-
-if api_token.startswith("AQ.") or api_token.startswith("ya29."):
-    from google.oauth2.credentials import Credentials
-    creds = Credentials(token=api_token)
-    genai.configure(credentials=creds)
-else:
-    genai.configure(api_key=api_token)
+genai.configure(api_key=api_token)
 
 # Use the stable, fast 1.5 flash model
 model = genai.GenerativeModel('gemini-1.5-flash')
@@ -59,7 +52,7 @@ def standardize_country(c):
     }
     # 1. Try exact match
     if c in mapping: return mapping[c]
-    # 2. Try partial match (e.g., catching "DE - NEMČIJA")
+    # 2. Try partial match
     for key, val in mapping.items():
         if key in c or c in key: return val
         
@@ -67,6 +60,13 @@ def standardize_country(c):
 
 # --- 3. USER INTERFACE ---
 st.title("📈 Master Logistics & Margin Auditor")
+
+# API Key Validation Warning
+if api_token.startswith("AQ."):
+    st.error("🚨 **CRITICAL AUTHENTICATION ERROR**: You are currently using an `AQ...` token. The Google Generative AI library requires a static API Key starting with `AIza...`. The app will likely fail to connect. Please generate a new API key at [Google AI Studio](https://aistudio.google.com/app/apikey).")
+elif not api_token:
+    st.warning("⚠️ No API Key found. Please add GEMINI_API_KEY to your Render environment variables.")
+
 st.markdown("Upload your monthly documents below to automatically generate your interactive financial dashboard.")
 
 col_u1, col_u2, col_u3 = st.columns(3)
@@ -123,16 +123,9 @@ if st.button("🚀 Execute Global Monthly Consolidation", type="primary", use_co
                         })
             except Exception as e: st.error(f"LTL Error: {e}")
 
-    # C. Process Courier PDFs via AI (Inline Memory Mode)
+    # C. Process Courier PDFs via AI
     if uploaded_couriers and api_token:
         progress_bar = st.progress(0)
-        
-        safety_settings = [
-            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
-        ]
         
         for idx, file in enumerate(uploaded_couriers):
             with st.spinner(f"AI scanning: {file.name}..."):
@@ -156,13 +149,10 @@ if st.button("🚀 Execute Global Monthly Consolidation", type="primary", use_co
                     mime_type = "application/pdf" if file.name.lower().endswith(".pdf") else file.type
                     if not mime_type: mime_type = "application/pdf"
                     
-                    # Send data "inline" to bypass Google Cloud Drive permissions error
-                    response = model.generate_content(
-                        [prompt, {"mime_type": mime_type, "data": fb}],
-                        safety_settings=safety_settings
-                    )
+                    # Direct generation call (Identical to your old working app, removed restrictive safety_settings)
+                    response = model.generate_content([prompt, {"mime_type": mime_type, "data": fb}])
                     
-                    # Clean the response manually (Stripping Markdown)
+                    # Robust cleaning
                     raw_text = response.text.strip()
                     raw_text = raw_text.replace("```json", "").replace("```", "").strip()
                         
@@ -192,7 +182,9 @@ if st.button("🚀 Execute Global Monthly Consolidation", type="primary", use_co
                     if idx < len(uploaded_couriers) - 1: time.sleep(12)
                         
                 except Exception as e:
-                    st.error(f"AI parsing failure on {file.name}: {str(e)}")
+                    # Detailed Error Catcher
+                    st.error(f"🛑 AI parsing failure on **{file.name}**")
+                    st.code(f"Error Type: {type(e).__name__}\nDetails: {str(e)}")
                     
             progress_bar.progress((idx + 1) / len(uploaded_couriers))
 
