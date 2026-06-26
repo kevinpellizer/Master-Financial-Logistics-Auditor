@@ -129,8 +129,6 @@ if st.button("🚀 Execute Global Monthly Consolidation", type="primary", use_co
             {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
         ]
         
-        json_config = genai.GenerationConfig(response_mime_type="application/json")
-        
         for idx, file in enumerate(uploaded_couriers):
             with st.spinner(f"AI scanning: {file.name}..."):
                 tmp_path = None
@@ -160,13 +158,13 @@ if st.button("🚀 Execute Global Monthly Consolidation", type="primary", use_co
                     ai_file = genai.upload_file(tmp_path, mime_type="application/pdf")
                     
                     # 3. Request Generation targeting the uploaded file reference
+                    # Note: Removed generation_config to prevent mutually exclusive arguments error with safety_settings
                     response = model.generate_content(
                         [prompt, ai_file],
-                        safety_settings=safety_settings,
-                        generation_config=json_config
+                        safety_settings=safety_settings
                     )
                     
-                    # 4. Clean the response (fallback in case it ignores JSON mode)
+                    # 4. Clean the response manually
                     raw_text = response.text.strip()
                     if raw_text.startswith("```"):
                         raw_text = raw_text.replace("```json", "").replace("```", "").strip()
@@ -306,6 +304,7 @@ if st.button("🚀 Execute Global Monthly Consolidation", type="primary", use_co
         </body></html>
         """
         
+        # Store Everything in Memory so the buttons don't break the screen
         out = BytesIO()
         with pd.ExcelWriter(out, engine='openpyxl') as writer:
             df_master.to_excel(writer, index=False, sheet_name='Master_Logistics_Ledger')
