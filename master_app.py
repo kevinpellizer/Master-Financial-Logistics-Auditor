@@ -11,7 +11,7 @@ import streamlit.components.v1 as components
 # --- 1. SETUP & CONFIGURATION ---
 st.set_page_config(page_title="Master Logistics & Margin Auditor", layout="wide", page_icon="📈")
 
-# 🚨 NEW: Session State initialization to prevent the dashboard from vanishing on download
+# 🚨 Session State initialization to prevent the dashboard from vanishing on download
 if 'audit_success' not in st.session_state:
     st.session_state.audit_success = False
     st.session_state.processed_html = None
@@ -133,83 +133,99 @@ if st.button("🚀 Execute Global Monthly Consolidation", type="primary", use_co
                         })
             except Exception as e: st.error(f"LTL Error: {e}")
 
-    # --- C: COURIER INVOICES (GEMINI AI) ---
+    # --- C: COURIER INVOICES (GEMINI AI WITH 3-RETRY SELF-HEALING) ---
     if uploaded_couriers and api_key:
         progress_bar = st.progress(0)
         for idx, file in enumerate(uploaded_couriers):
             with st.spinner(f"AI scanning: {file.name}..."):
-                try:
-                    p = (
-                        "You are an expert logistics auditor. Extract every single shipment line-by-line from this invoice document. "
-                        "Return ONLY a valid JSON object. Do not include any conversational text. "
-                        "The JSON object must have exactly two root keys: "
-                        "1) 'invoice_net_total': a float representing the total net invoice amount usually found at the bottom of the document. "
-                        "2) 'shipments': a list of objects representing each individual shipment row. "
-                        "Each object inside 'shipments' MUST contain these exact keys: "
-                        "'tracking_nr' (string), 'country' (string, destination code), 'carrier' (string), 'cost' (float, total net amount for this row excluding VAT)."
-                    )
-                    file_bytes = file.getvalue()
-                    mime_type = file.type if file.type else "application/pdf"
-                    
-                    # 🚨 NEW: Smart Model Fallback System + Strict JSON Mode Enforced
+                
+                max_retries = 3
+                success = False
+                last_error = ""
+                
+                for attempt in range(max_retries):
                     try:
-                        active_model = genai.GenerativeModel('gemini-1.5-pro-latest')
-                        response = active_model.generate_content(
-                            [p, {"mime_type": mime_type, "data": file_bytes}],
-                            generation_config=genai.GenerationConfig(response_mime_type="application/json")
+                        p = (
+                            "You are an expert logistics auditor. Extract every single shipment line-by-line from this invoice document. "
+                            "Return ONLY a valid JSON object. Do not include any conversational text. "
+                            "The JSON object must have exactly two root keys: "
+                            "1) 'invoice_net_total': a float representing the total net invoice amount usually found at the bottom of the document. "
+                            "2) 'shipments': a list of objects representing each individual shipment row. "
+                            "Each object inside 'shipments' MUST contain these exact keys: "
+                            "'tracking_nr' (string), 'country' (string, destination code), 'carrier' (string), 'cost' (float, total net amount for this row excluding VAT)."
                         )
-                    except Exception as primary_error:
-                        # If Pro fails (e.g. 404 or quota), instantly swap to Flash
-                        active_model = genai.GenerativeModel('gemini-1.5-flash-latest')
-                        response = active_model.generate_content(
-                            [p, {"mime_type": mime_type, "data": file_bytes}],
-                            generation_config=genai.GenerationConfig(response_mime_type="application/json")
-                        )
+                        file_bytes = file.getvalue()
+                        mime_type = file.type if file.type else "application/pdf"
+                        
+                        try:
+                            # Primary attempt
+                            active_model = genai.GenerativeModel('gemini-1.5-pro')
+                            response = active_model.generate_content(
+                                [p, {"mime_type": mime_type, "data": file_bytes}],
+                                generation_config=genai.GenerationConfig(response_mime_type="application/json")
+                            )
+                        except Exception:
+                            # Failsafe if 403 or quota limits hit
+                            active_model = genai.GenerativeModel('gemini-1.5-flash')
+                            response = active_model.generate_content(
+                                [p, {"mime_type": mime_type, "data": file_bytes}],
+                                generation_config=genai.GenerationConfig(response_mime_type="application/json")
+                            )
 
-                    # Ensure we actually got a response
-                    if not response.parts:
-                        raise ValueError("AI blocked the request or returned an empty response.")
+                        if not response.parts:
+                            raise ValueError("AI returned an empty response.")
+                            
+                        # Safe extraction to prevent markdown breakage
+                        raw_text = response.text.strip()
+                        marker = "`" * 3
                         
-                    raw_text = response.text.strip()
-                    
-                    # Failsafe cleaner just in case the model ignores JSON strict mode
-                    if "```json" in raw_text: 
-                        raw_text = raw_text.split("```json")[1].split("```")[0].strip()
-                    elif "```" in raw_text: 
-                        raw_text = raw_text.split("```")[1].split("```")[0].strip()
-                    
-                    try:
-                        data = json.loads(raw_text)
-                    except json.JSONDecodeError:
-                        # Extreme fallback: locate boundaries manually
-                        start = raw_text.find('{')
-                        end = raw_text.rfind('}')
-                        data = json.loads(raw_text[start:end+1])
-                    
-                    # Math Reconciliation Logic
-                    file_net_total = parse_financial_value(str(data.get('invoice_net_total', 0)))
-                    file_extracted_sum = sum(parse_financial_value(str(s.get('cost', 0))) for s in data.get('shipments', []))
-                    reconciliation_log.append({
-                        'file': file.name,
-                        'invoice_total': file_net_total,
-                        'extracted_sum': file_extracted_sum,
-                        'diff': abs(file_net_total - file_extracted_sum)
-                    })
-                    
-                    for s in data.get('shipments', []):
-                        all_shipment_rows.append({
-                            'country': standardize_country(s.get('country')),
-                            'carrier': str(s.get('carrier', file.name.split('.')[0])).strip().upper(),
-                            'cost': parse_financial_value(str(s.get('cost', 0))),
-                            'source': file.name
+                        if marker + "json" in raw_text: 
+                            raw_text = raw_text.split(marker + "json")[1].split(marker)[0].strip()
+                        elif marker in raw_text: 
+                            raw_text = raw_text.split(marker)[1].split(marker)[0].strip()
+                        
+                        try:
+                            data = json.loads(raw_text)
+                        except json.JSONDecodeError:
+                            start = raw_text.find('{')
+                            end = raw_text.rfind('}')
+                            if start != -1 and end != -1:
+                                data = json.loads(raw_text[start:end+1])
+                            else:
+                                raise ValueError(f"Could not locate JSON formatting.")
+                        
+                        # Math Reconciliation Logic
+                        file_net_total = parse_financial_value(str(data.get('invoice_net_total', 0)))
+                        file_extracted_sum = sum(parse_financial_value(str(s.get('cost', 0))) for s in data.get('shipments', []))
+                        reconciliation_log.append({
+                            'file': file.name,
+                            'invoice_total': file_net_total,
+                            'extracted_sum': file_extracted_sum,
+                            'diff': abs(file_net_total - file_extracted_sum)
                         })
-                    
-                    # Crucial Anti-Spam API Pause
-                    if idx < len(uploaded_couriers) - 1: 
-                        time.sleep(5)
                         
-                except Exception as e: 
-                    st.error(f"AI parsing failure on {file.name} - Reason: {str(e)}")
+                        for s in data.get('shipments', []):
+                            all_shipment_rows.append({
+                                'country': standardize_country(s.get('country')),
+                                'carrier': str(s.get('carrier', file.name.split('.')[0])).strip().upper(),
+                                'cost': parse_financial_value(str(s.get('cost', 0))),
+                                'source': file.name
+                            })
+                            
+                        success = True
+                        break # Break out of the retry loop if successful
+                            
+                    except Exception as e: 
+                        last_error = str(e)
+                        time.sleep(3) # Wait 3 seconds before retrying
+                
+                if not success:
+                    st.error(f"AI parsing failed completely on {file.name} after 3 attempts. Last error: {last_error}")
+                    
+                # Crucial Anti-Spam API Pause
+                if idx < len(uploaded_couriers) - 1: 
+                    time.sleep(4)
+                    
             progress_bar.progress((idx + 1) / len(uploaded_couriers))
 
     # --- 4. DATA CONSOLIDATION & HTML GENERATION ---
@@ -332,29 +348,4 @@ if st.session_state.get('audit_success', False):
             if rec['diff'] <= 1.00:
                 st.success(f"✅ **{rec['file']}**: Math checks out! (Invoice Net: €{rec['invoice_total']:,.2f} | Rows Added: €{rec['extracted_sum']:,.2f})")
             else:
-                st.error(f"⚠️ **{rec['file']}**: Discrepancy of €{rec['diff']:,.2f}! (Invoice Net: €{rec['invoice_total']:,.2f} | Rows Added: €{rec['extracted_sum']:,.2f})")
-        st.divider()
-
-    st.subheader("📊 Live Interactive Executive Dashboard")
-    components.html(st.session_state.processed_html, height=950, scrolling=True)
-    
-    st.subheader("📥 Export Reports")
-    col_exp1, col_exp2 = st.columns(2)
-    
-    with col_exp1:
-        st.download_button(
-            label="📁 Download Raw Excel Ledger",
-            data=st.session_state.processed_excel,
-            file_name="Verified_Monthly_Audit.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True
-        )
-        
-    with col_exp2:
-        st.download_button(
-            label="🌐 Download Trello HTML Dashboard",
-            data=st.session_state.processed_html.encode('utf-8'),
-            file_name="KingsBox_Monthly_Dashboard.html",
-            mime="text/html",
-            use_container_width=True
-        )
+                st.error(f"⚠️ **{rec['file']}**: Discrepancy of €{rec['diff']:,.2f}! (Invoice Net: €{rec['invoice_total']:,.2f} | Rows Added: €{
