@@ -11,7 +11,7 @@ import streamlit.components.v1 as components
 # --- 1. SETUP & CONFIGURATION ---
 st.set_page_config(page_title="Master Logistics & Margin Auditor", layout="wide", page_icon="📈")
 
-# Memory initialization so the dashboard doesn't disappear when you download
+# Session State initialization
 if 'audit_success' not in st.session_state:
     st.session_state.audit_success = False
     st.session_state.processed_html = None
@@ -23,9 +23,6 @@ if not api_key:
     st.warning("⚠️ GEMINI_API_KEY not found. Please set it in Render Environment Variables.")
 else:
     genai.configure(api_key=api_key)
-
-# 🚨 BACK TO THE WORKING MODEL FROM THIS MORNING
-model = genai.GenerativeModel('gemini-2.5-flash')
 
 st.title("📈 Master Logistics & Margin Auditor")
 st.markdown("Upload your monthly documents below to automatically generate your interactive financial dashboard.")
@@ -136,9 +133,23 @@ if st.button("🚀 Execute Global Monthly Consolidation", type="primary", use_co
                         })
             except Exception as e: st.error(f"LTL Error: {e}")
 
-    # --- C: COURIER INVOICES (SIMPLE & DIRECT) ---
+    # --- C: COURIER INVOICES (API BLOCK BYPASS) ---
     if uploaded_couriers and api_key:
         progress_bar = st.progress(0)
+        
+        # 🚨 1. Use the most stable standard models available
+        model_flash = genai.GenerativeModel('gemini-1.5-flash')
+        model_pro = genai.GenerativeModel('gemini-1.5-pro')
+        
+        # 🚨 2. TURN OFF SAFETY FILTERS: DHL invoices contain customer names, addresses, and tracking codes. 
+        # Google's API will block the request and return empty if it thinks you're scraping personal info.
+        safe = [
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
+        ]
+        
         for idx, file in enumerate(uploaded_couriers):
             with st.spinner(f"AI scanning: {file.name}..."):
                 try:
@@ -146,35 +157,28 @@ if st.button("🚀 Execute Global Monthly Consolidation", type="primary", use_co
                         "Extract every single shipment line-by-line. Use ONLY these exact keys: 'tracking_nr', 'country', 'carrier', 'cost'. "
                         "The 'cost' MUST be the TOTAL NET AMOUNT. EXCLUDE VAT/Taxes. "
                         "Crucially, find the total net invoice amount at the bottom of the document and save it under the key 'invoice_net_total'. "
-                        "Return strictly as a single JSON object with a 'shipments' array. "
-                        "CRITICAL INSTRUCTION: Do NOT use markdown formatting. Do NOT use backticks. Return ONLY pure raw JSON text."
+                        "Return strictly as a single JSON object with a 'shipments' array."
                     )
                     file_bytes = file.getvalue()
+                    mime = "application/pdf" if file.name.lower().endswith(".pdf") else file.type
                     
-                    # Hardcode PDF mime_type in case Streamlit misses it (which causes instant API rejection)
-                    mime_type = "application/pdf" if file.name.lower().endswith(".pdf") else file.type
-                    if not mime_type: mime_type = "application/pdf"
-                    
-                    # 🚨 Direct call, exactly as it was when it worked
-                    response = model.generate_content([p, {"mime_type": mime_type, "data": file_bytes}])
-                    
+                    # Try Flash first for speed
                     try:
-                        raw_text = response.text.strip()
+                        response = model_flash.generate_content([p, {"mime_type": mime, "data": file_bytes}], safety_settings=safe)
                     except Exception:
-                        raise ValueError("AI returned an empty response. The document might be unreadable.")
-                        
-                    # 🚨 Safe, bulletproof parsing
-                    bt = chr(96) * 3 # Mathematically strip markdown if AI disobeys
-                    raw_text = raw_text.replace(bt + "json", "").replace(bt, "").strip()
+                        # Fallback to Pro
+                        response = model_pro.generate_content([p, {"mime_type": mime, "data": file_bytes}], safety_settings=safe)
                     
+                    if not response.parts:
+                        raise ValueError("Google API blocked this PDF or returned an empty response.")
+                        
+                    # 🚨 Safe, simple parsing
+                    raw_text = response.text.strip()
                     start = raw_text.find('{')
                     end = raw_text.rfind('}')
                     
                     if start != -1 and end != -1:
-                        try:
-                            data = json.loads(raw_text[start:end+1])
-                        except json.JSONDecodeError as jde:
-                            raise ValueError(f"AI returned corrupted JSON data: {str(jde)}")
+                        data = json.loads(raw_text[start:end+1])
                     else:
                         raise ValueError("No JSON found in AI response.")
                     
@@ -189,10 +193,11 @@ if st.button("🚀 Execute Global Monthly Consolidation", type="primary", use_co
                         'diff': abs(file_net_total - file_extracted_sum)
                     })
                     
+                    carrier_fallback = file.name.split('.')[0].upper()
                     for s in data.get('shipments', []):
                         all_shipment_rows.append({
                             'country': standardize_country(s.get('country')),
-                            'carrier': str(s.get('carrier', file.name.split('.')[0])).strip().upper(),
+                            'carrier': str(s.get('carrier', carrier_fallback)).strip().upper(),
                             'cost': parse_financial_value(str(s.get('cost', 0))),
                             'source': file.name
                         })
@@ -219,11 +224,13 @@ if st.button("🚀 Execute Global Monthly Consolidation", type="primary", use_co
         ordered_countries = ["Nemčija", "Italija", "Slovenija", "Francija", "Kuwait (Oxygen)", "OSTALO", "Nizozemska", "Španija", "Belgija", "Švica", "Avstrija", "Hrvaška", "Luksemburg"]
         chart_rev_data = [round(revenue_dict.get(c, 0.0), 2) for c in ordered_countries]
         chart_log_data = [round(country_costs.get(c, 0.0), 2) for c in ordered_countries]
-        chart_carrier_labels, chart_carrier_data = list(carrier_costs.keys()), [round(v, 2) for v in carrier_costs.values()]
+        chart_carrier_labels = list(carrier_costs.keys())
+        chart_carrier_data = [round(v, 2) for v in carrier_costs.values()]
         
         table_rows_html = ""
         for c in ordered_countries:
-            rev, log = revenue_dict.get(c, 0.0), country_costs.get(c, 0.0)
+            rev = revenue_dict.get(c, 0.0)
+            log = country_costs.get(c, 0.0)
             pct = (log / rev * 100) if rev > 0 else 0.0
             badge = "badge-green" if pct < 10 else "badge-yellow" if pct < 20 else "badge-red"
             table_rows_html += f'<tr><td>{c}</td><td class="num-col">€{rev:,.2f}</td><td class="num-col">€{log:,.2f}</td><td class="num-col"><span class="{badge}">{pct:.2f}%</span></td></tr>'
@@ -314,8 +321,8 @@ if st.button("🚀 Execute Global Monthly Consolidation", type="primary", use_co
         st.session_state.processed_excel = out.getvalue()
         st.session_state.reconciliation_log = reconciliation_log
         st.session_state.audit_success = True
-    else:
-        st.error("No valid shipment rows were extracted. Please check the logs.")
+    elif not uploaded_couriers and not uploaded_ltl:
+        st.warning("Please upload files to execute the consolidation.")
 
 # --- 5. RENDER THE SECURE DISPLAY LAYER ---
 if st.session_state.get('audit_success', False):
