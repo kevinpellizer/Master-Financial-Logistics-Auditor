@@ -6,6 +6,7 @@ import os
 import time
 from io import BytesIO
 import re
+import tempfile
 import streamlit.components.v1 as components
 
 # --- 1. SETUP & AUTH ---
@@ -117,11 +118,10 @@ if st.button("🚀 Execute Global Monthly Consolidation", type="primary", use_co
                         })
             except Exception as e: st.error(f"LTL Error: {e}")
 
-    # C. Process Courier PDFs via AI
+    # C. Process Courier PDFs via AI (Using Secure File Upload API)
     if uploaded_couriers and api_token:
         progress_bar = st.progress(0)
         
-        # Turn off safety filters to prevent DHL invoices with addresses from being blocked
         safety_settings = [
             {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
             {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
@@ -129,11 +129,12 @@ if st.button("🚀 Execute Global Monthly Consolidation", type="primary", use_co
             {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
         ]
         
-        # Force JSON response schema
         json_config = genai.GenerationConfig(response_mime_type="application/json")
         
         for idx, file in enumerate(uploaded_couriers):
             with st.spinner(f"AI scanning: {file.name}..."):
+                tmp_path = None
+                ai_file = None
                 try:
                     prompt = """
                     Extract every shipment line-by-line. 
@@ -149,18 +150,28 @@ if st.button("🚀 Execute Global Monthly Consolidation", type="primary", use_co
                         ]
                     }
                     """
-                    fb = file.getvalue()
-                    mime_type = "application/pdf" if file.name.lower().endswith(".pdf") else file.type
                     
-                    # API Call
+                    # 1. Create a temporary physical file
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                        tmp.write(file.getvalue())
+                        tmp_path = tmp.name
+                    
+                    # 2. Securely upload to Google's File API
+                    ai_file = genai.upload_file(tmp_path, mime_type="application/pdf")
+                    
+                    # 3. Request Generation targeting the uploaded file reference
                     response = model.generate_content(
-                        [prompt, {"mime_type": mime_type, "data": fb}],
+                        [prompt, ai_file],
                         safety_settings=safety_settings,
                         generation_config=json_config
                     )
                     
-                    # Because we forced JSON mode, response.text IS a JSON string. No stripping required.
-                    data = json.loads(response.text)
+                    # 4. Clean the response (fallback in case it ignores JSON mode)
+                    raw_text = response.text.strip()
+                    if raw_text.startswith("```"):
+                        raw_text = raw_text.replace("```json", "").replace("```", "").strip()
+                        
+                    data = json.loads(raw_text)
                     
                     # Math Reconciliation
                     file_net_total = parse_financial_value(str(data.get('invoice_net_total', 0)))
@@ -187,6 +198,13 @@ if st.button("🚀 Execute Global Monthly Consolidation", type="primary", use_co
                         
                 except Exception as e:
                     st.error(f"AI parsing failure on {file.name}: {str(e)}")
+                finally:
+                    # Cleanup: Ensure Google's server and your server stay clean
+                    if ai_file:
+                        try: genai.delete_file(ai_file.name)
+                        except: pass
+                    if tmp_path and os.path.exists(tmp_path):
+                        os.remove(tmp_path)
                     
             progress_bar.progress((idx + 1) / len(uploaded_couriers))
 
@@ -217,7 +235,7 @@ if st.button("🚀 Execute Global Monthly Consolidation", type="primary", use_co
             top_5_html += f"<tr><td>{row['carrier']}<span class='client-tag'>{row['source'].replace('.xlsx','').replace('.csv','')}</span></td><td>{row['country']}</td><td class='cost-col'>€{row['cost']:,.2f}</td></tr>"
 
         html_dashboard_code = f"""
-        <!DOCTYPE html><html><head><script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+        <!DOCTYPE html><html><head><script src="[https://cdn.jsdelivr.net/npm/chart.js](https://cdn.jsdelivr.net/npm/chart.js)"></script>
         <style>
             body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f1f5f9; color: #1e293b; margin:0; padding:40px; }}
             .dashboard {{ max-width: 1400px; margin: 0 auto; }}
@@ -297,15 +315,20 @@ if st.button("🚀 Execute Global Monthly Consolidation", type="primary", use_co
         st.session_state.reconciliation_log = reconciliation_log
         st.session_state.audit_success = True
     else:
-        st.error("No data extracted. Check logs.")
+        st.error("No valid shipment rows were extracted. Please check the logs.")
 
-# --- 6. RENDER RESULTS ---
+# --- 5. RENDER THE SECURE DISPLAY LAYER ---
 if st.session_state.get('audit_success', False):
     
     if st.session_state.reconciliation_log:
         st.subheader("⚖️ AI Audit Verification (Math Check)")
         for rec in st.session_state.reconciliation_log:
-            file_name, inv_total, ext_total, diff = rec['file'], rec['invoice_total'], rec['extracted_sum'], rec['diff']
+            # 🚨 NEW: Shortened variable names so the strings never break during copy/paste
+            file_name = rec['file']
+            inv_total = rec['invoice_total']
+            ext_total = rec['extracted_sum']
+            diff = rec['diff']
+            
             if diff <= 1.00:
                 st.success(f"✅ **{file_name}**: Math checks out! (Net: €{inv_total:,.2f} | Added: €{ext_total:,.2f})")
             else:
@@ -319,7 +342,19 @@ if st.session_state.get('audit_success', False):
     col_exp1, col_exp2 = st.columns(2)
     
     with col_exp1:
-        st.download_button("📁 Download Raw Excel Ledger", data=st.session_state.processed_excel, file_name="Verified_Monthly_Audit.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+        st.download_button(
+            label="📁 Download Raw Excel Ledger",
+            data=st.session_state.processed_excel,
+            file_name="Verified_Monthly_Audit.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
+        )
         
     with col_exp2:
-        st.download_button("🌐 Download Trello HTML Dashboard", data=st.session_state.processed_html.encode('utf-8'), file_name="KingsBox_Monthly_Dashboard.html", mime="text/html", use_container_width=True)
+        st.download_button(
+            label="🌐 Download Trello HTML Dashboard",
+            data=st.session_state.processed_html.encode('utf-8'),
+            file_name="KingsBox_Monthly_Dashboard.html",
+            mime="text/html",
+            use_container_width=True
+        )
