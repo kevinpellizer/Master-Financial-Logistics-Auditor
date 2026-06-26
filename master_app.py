@@ -158,17 +158,11 @@ if st.button("🚀 Execute Global Monthly Consolidation", type="primary", use_co
                         mime_type = file.type if file.type else "application/pdf"
                         
                         try:
-                            active_model = genai.GenerativeModel('gemini-1.5-pro-latest')
-                            response = active_model.generate_content(
-                                [p, {"mime_type": mime_type, "data": file_bytes}],
-                                generation_config=genai.GenerationConfig(response_mime_type="application/json")
-                            )
+                            active_model = genai.GenerativeModel('gemini-1.5-flash')
+                            response = active_model.generate_content([p, {"mime_type": mime_type, "data": file_bytes}])
                         except Exception:
-                            active_model = genai.GenerativeModel('gemini-1.5-flash-latest')
-                            response = active_model.generate_content(
-                                [p, {"mime_type": mime_type, "data": file_bytes}],
-                                generation_config=genai.GenerationConfig(response_mime_type="application/json")
-                            )
+                            active_model = genai.GenerativeModel('gemini-1.5-pro')
+                            response = active_model.generate_content([p, {"mime_type": mime_type, "data": file_bytes}])
 
                         if not response.parts:
                             raise ValueError("AI returned an empty response.")
