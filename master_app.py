@@ -1,21 +1,18 @@
 import streamlit as st
-import google.generativeai as genai
 import pandas as pd
 import json
 import os
 import time
 from io import BytesIO
 import re
+import base64
+import requests
 import streamlit.components.v1 as components
 
 # --- 1. SETUP & AUTH ---
 st.set_page_config(page_title="KingsBox Audit App", layout="wide", page_icon="📈")
 
 api_token = os.environ.get("GEMINI_API_KEY", "").strip()
-genai.configure(api_key=api_token)
-
-# Use the stable, fast 1.5 flash model
-model = genai.GenerativeModel('gemini-1.5-flash')
 
 # --- 2. HELPER FUNCTIONS ---
 def parse_financial_value(val):
@@ -61,11 +58,10 @@ def standardize_country(c):
 # --- 3. USER INTERFACE ---
 st.title("📈 Master Logistics & Margin Auditor")
 
-# API Key Validation Warning
-if api_token.startswith("AQ."):
-    st.error("🚨 **CRITICAL AUTHENTICATION ERROR**: You are currently using an `AQ...` token. The Google Generative AI library requires a static API Key starting with `AIza...`. The app will likely fail to connect. Please generate a new API key at [Google AI Studio](https://aistudio.google.com/app/apikey).")
-elif not api_token:
+if not api_token:
     st.warning("⚠️ No API Key found. Please add GEMINI_API_KEY to your Render environment variables.")
+elif api_token.startswith("AQ."):
+    st.info("ℹ️ Using an AQ Session Token. Ensure it hasn't expired (they typically last 1 hour).")
 
 st.markdown("Upload your monthly documents below to automatically generate your interactive financial dashboard.")
 
@@ -123,10 +119,19 @@ if st.button("🚀 Execute Global Monthly Consolidation", type="primary", use_co
                         })
             except Exception as e: st.error(f"LTL Error: {e}")
 
-    # C. Process Courier PDFs via AI
+    # C. Process Courier PDFs via DIRECT REST API (Bypassing Python Library entirely)
     if uploaded_couriers and api_token:
         progress_bar = st.progress(0)
         
+        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+        headers = {"Content-Type": "application/json"}
+        
+        # Smart Auth Routing
+        if api_token.startswith("AQ.") or api_token.startswith("ya29."):
+            headers["Authorization"] = f"Bearer {api_token}"
+        else:
+            url += f"?key={api_token}"
+            
         for idx, file in enumerate(uploaded_couriers):
             with st.spinner(f"AI scanning: {file.name}..."):
                 try:
@@ -145,16 +150,42 @@ if st.button("🚀 Execute Global Monthly Consolidation", type="primary", use_co
                     }
                     """
                     
+                    # Convert PDF to Base64 for safe inline transit
                     fb = file.getvalue()
+                    b64_pdf = base64.b64encode(fb).decode('utf-8')
                     mime_type = "application/pdf" if file.name.lower().endswith(".pdf") else file.type
                     if not mime_type: mime_type = "application/pdf"
                     
-                    # Direct generation call (Identical to your old working app, removed restrictive safety_settings)
-                    response = model.generate_content([prompt, {"mime_type": mime_type, "data": fb}])
+                    payload = {
+                        "contents": [{
+                            "parts": [
+                                {"text": prompt},
+                                {"inlineData": {"mimeType": mime_type, "data": b64_pdf}}
+                            ]
+                        }],
+                        "safetySettings": [
+                            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+                            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+                            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+                            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
+                        ]
+                    }
                     
-                    # Robust cleaning
-                    raw_text = response.text.strip()
-                    raw_text = raw_text.replace("```json", "").replace("```", "").strip()
+                    # Direct HTTP Request
+                    response = requests.post(url, headers=headers, json=payload)
+                    
+                    if response.status_code != 200:
+                        raise Exception(f"Google API Error [{response.status_code}]: {response.text}")
+                        
+                    resp_data = response.json()
+                    
+                    if 'candidates' not in resp_data or not resp_data['candidates']:
+                        raise Exception(f"Google returned an empty response. It likely blocked the file. Full output: {resp_data}")
+                        
+                    # Extract the text and clean it
+                    raw_text = resp_data['candidates'][0]['content']['parts'][0]['text'].strip()
+                    if raw_text.startswith("```"):
+                        raw_text = raw_text.replace("```json", "").replace("```", "").strip()
                         
                     data = json.loads(raw_text)
                     
@@ -184,7 +215,7 @@ if st.button("🚀 Execute Global Monthly Consolidation", type="primary", use_co
                 except Exception as e:
                     # Detailed Error Catcher
                     st.error(f"🛑 AI parsing failure on **{file.name}**")
-                    st.code(f"Error Type: {type(e).__name__}\nDetails: {str(e)}")
+                    st.code(f"Details:\n{str(e)}")
                     
             progress_bar.progress((idx + 1) / len(uploaded_couriers))
 
@@ -215,127 +246,9 @@ if st.button("🚀 Execute Global Monthly Consolidation", type="primary", use_co
             top_5_html += f"<tr><td>{row['carrier']}<span class='client-tag'>{row['source'].replace('.xlsx','').replace('.csv','')}</span></td><td>{row['country']}</td><td class='cost-col'>€{row['cost']:,.2f}</td></tr>"
 
         html_dashboard_code = f"""
-        <!DOCTYPE html><html><head><script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+        <!DOCTYPE html><html><head><script src="[https://cdn.jsdelivr.net/npm/chart.js](https://cdn.jsdelivr.net/npm/chart.js)"></script>
         <style>
             body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f1f5f9; color: #1e293b; margin:0; padding:40px; }}
             .dashboard {{ max-width: 1400px; margin: 0 auto; }}
             .header {{ background: #0f172a; color: white; padding: 30px 40px; border-radius: 16px; margin-bottom: 30px; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 10px 15px -3px rgba(0,0,0,0.1); }}
-            .header h1 {{ margin: 0 0 8px 0; font-size: 28px; }}
-            .header p {{ margin: 0; color: #94a3b8; font-size: 16px; }}
-            .status-badge {{ background: #10b981; color: white; padding: 8px 16px; border-radius: 20px; font-size: 14px; font-weight: bold; text-transform: uppercase; }}
-            .kpi-row {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 25px; margin-bottom: 35px; }}
-            .kpi-card {{ background: white; padding: 30px; border-radius: 16px; border-left: 6px solid #3b82f6; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05); }}
-            .kpi-card h3 {{ margin: 0 0 10px 0; color: #64748b; font-size: 14px; text-transform: uppercase; }}
-            .kpi-card .value {{ margin: 0; font-size: 34px; font-weight: 800; color: #0f172a; }}
-            .charts-row {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; margin-bottom: 35px; }}
-            .chart-container {{ background: white; padding: 25px; border-radius: 16px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05); }}
-            .chart-container h2 {{ margin: 0 0 20px 0; font-size: 16px; color: #0f172a; border-bottom: 2px solid #f1f5f9; padding-bottom: 15px; }}
-            .tables-split-row {{ display: grid; grid-template-columns: 1.2fr 1fr; gap: 30px; margin-bottom: 40px; }}
-            .table-container {{ background: white; padding: 30px; border-radius: 16px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05); }}
-            .table-container h2 {{ margin: 0 0 20px 0; font-size: 18px; border-bottom: 2px solid #f1f5f9; padding-bottom: 15px; }}
-            .data-table {{ width: 100%; border-collapse: collapse; }}
-            .data-table th {{ background: #f8fafc; padding: 14px; text-align: left; font-size: 12px; color: #475569; border-bottom: 2px solid #e2e8f0; text-transform: uppercase; }}
-            .data-table td {{ padding: 14px; border-bottom: 1px solid #e2e8f0; font-size: 14px; font-weight: 500; }}
-            .num-col {{ font-family: monospace; font-size: 14px; text-align: right; }}
-            .cost-col {{ color: #dc2626; font-weight: 700; text-align: right; font-family: monospace; font-size: 15px; }}
-            .badge-green {{ background: #dcfce7; color: #166534; padding: 4px 10px; border-radius: 6px; font-weight: bold; }}
-            .badge-yellow {{ background: #fef9c3; color: #854d0e; padding: 4px 10px; border-radius: 6px; font-weight: bold; }}
-            .badge-red {{ background: #fee2e2; color: #991b1b; padding: 4px 10px; border-radius: 6px; font-weight: bold; }}
-            .client-tag {{ font-size: 11px; color: #475569; font-weight: 700; background: #f1f5f9; padding: 3px 8px; border-radius: 4px; display: block; margin-top: 4px; max-width: max-content; }}
-        </style></head>
-        <body>
-        <div class="dashboard">
-            <div class="header">
-                <div><h1>KingsBox | Financial Margin Report</h1><p>Logistics Cost-to-Serve vs Revenue Analysis</p></div>
-                <div class="status-badge">Auto-Generated</div>
-            </div>
-            <div class="kpi-row">
-                <div class="kpi-card" style="border-left-color: #10b981;"><h3>Total Global Revenue</h3><p class="value">€{total_global_revenue:,.2f}</p></div>
-                <div class="kpi-card" style="border-left-color: #ef4444;"><h3>Total Logistics Spend</h3><p class="value">€{total_logistics_spend:,.2f}</p></div>
-                <div class="kpi-card" style="border-left-color: #8b5cf6;"><h3>Average Cost-to-Serve</h3><p class="value">{avg_cost_to_serve:.2f}%</p></div>
-            </div>
-            <div class="charts-row">
-                <div class="chart-container"><h2>Revenue Distribution</h2><canvas id="revChart"></canvas></div>
-                <div class="chart-container"><h2>Logistics Distribution</h2><canvas id="logChart"></canvas></div>
-                <div class="chart-container"><h2>Carrier Budget Allocation</h2><canvas id="carrierChart"></canvas></div>
-            </div>
-            <div class="tables-split-row">
-                <div class="table-container">
-                    <h2>Margin Impact Analysis (Cost-to-Serve %)</h2>
-                    <table class="data-table">
-                        <thead><tr><th>Market / Region</th><th style="text-align: right;">Revenue</th><th style="text-align: right;">Logistics Costs</th><th style="text-align: right;">% Share</th></tr></thead>
-                        <tbody>{table_rows_html}</tbody>
-                    </table>
-                </div>
-                <div class="table-container">
-                    <h2>Top 5 High-Freight Individual Shipments</h2>
-                    <table class="data-table">
-                        <thead><tr><th>Carrier / Source</th><th>Country</th><th style="text-align: right;">Freight Billed</th></tr></thead>
-                        <tbody>{top_5_html}</tbody>
-                    </table>
-                </div>
-            </div>
-        </div>
-        <script>
-            const l13 = {json.dumps(ordered_countries)};
-            const c13 = ['#3b82f6', '#10b981', '#6366f1', '#f59e0b', '#14b8a6', '#94a3b8', '#84cc16', '#ef4444', '#8b5cf6', '#0ea5e9', '#d946ef', '#f97316', '#f43f5e'];
-            new Chart(document.getElementById('revChart'), {{type: 'pie', data: {{labels: l13, datasets: [{{data: {json.dumps(chart_rev_data)}, backgroundColor: c13}}]}}, options: {{plugins: {{legend: {{display: false}}}}}} }});
-            new Chart(document.getElementById('logChart'), {{type: 'pie', data: {{labels: l13, datasets: [{{data: {json.dumps(chart_log_data)}, backgroundColor: c13}}]}}, options: {{plugins: {{legend: {{display: false}}}}}} }});
-            new Chart(document.getElementById('carrierChart'), {{type: 'doughnut', data: {{labels: {json.dumps(chart_carrier_labels)}, datasets: [{{data: {json.dumps(chart_carrier_data)}, backgroundColor: ['#0f172a', '#2563eb', '#dc2626', '#16a34a', '#eab308', '#9333ea', '#0ea5e9', '#4f46e5', '#475569', '#cbd5e1']}}]}}, options: {{cutout: '55%', plugins: {{legend: {{display: false}}}}}} }});
-        </script>
-        </body></html>
-        """
-        
-        # Store Everything in Memory so the buttons don't break the screen
-        out = BytesIO()
-        with pd.ExcelWriter(out, engine='openpyxl') as writer:
-            df_master.to_excel(writer, index=False, sheet_name='Master_Logistics_Ledger')
-            
-        st.session_state.processed_html = html_dashboard_code
-        st.session_state.processed_excel = out.getvalue()
-        st.session_state.reconciliation_log = reconciliation_log
-        st.session_state.audit_success = True
-    else:
-        st.error("No valid shipment rows were extracted. Please check the logs.")
-
-# --- 5. RENDER THE SECURE DISPLAY LAYER ---
-if st.session_state.get('audit_success', False):
-    
-    if st.session_state.reconciliation_log:
-        st.subheader("⚖️ AI Audit Verification (Math Check)")
-        for rec in st.session_state.reconciliation_log:
-            # Shortened variable names so the strings never break during copy/paste
-            file_name = rec['file']
-            inv_total = rec['invoice_total']
-            ext_total = rec['extracted_sum']
-            diff = rec['diff']
-            
-            if diff <= 1.00:
-                st.success(f"✅ **{file_name}**: Math checks out! (Net: €{inv_total:,.2f} | Added: €{ext_total:,.2f})")
-            else:
-                st.error(f"⚠️ **{file_name}**: Diff of €{diff:,.2f}! (Net: €{inv_total:,.2f} | Added: €{ext_total:,.2f})")
-        st.divider()
-
-    st.subheader("📊 Live Interactive Executive Dashboard")
-    components.html(st.session_state.processed_html, height=950, scrolling=True)
-    
-    st.subheader("📥 Export Reports")
-    col_exp1, col_exp2 = st.columns(2)
-    
-    with col_exp1:
-        st.download_button(
-            label="📁 Download Raw Excel Ledger",
-            data=st.session_state.processed_excel,
-            file_name="Verified_Monthly_Audit.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True
-        )
-        
-    with col_exp2:
-        st.download_button(
-            label="🌐 Download Trello HTML Dashboard",
-            data=st.session_state.processed_html.encode('utf-8'),
-            file_name="KingsBox_Monthly_Dashboard.html",
-            mime="text/html",
-            use_container_width=True
-        )
+            .header h1 {{ margin: 0 0 8px 0; font-size:
