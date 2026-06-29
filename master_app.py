@@ -10,7 +10,8 @@ from io import BytesIO
 # --- 1. SETUP ---
 st.set_page_config(page_title="PDF to Excel Extractor", layout="wide", page_icon="📄")
 
-api_token = os.environ.get("GEMINI_API_KEY", "").strip()
+# Strip quotes or spaces that might have accidentally been pasted into Render
+env_token = os.environ.get("GEMINI_API_KEY", "").replace('"', '').replace("'", "").strip()
 
 def clean_cost(val):
     """Converts European currency strings to math-friendly floats"""
@@ -31,29 +32,31 @@ def clean_cost(val):
 
 # --- 2. USER INTERFACE ---
 st.title("📄 Step 1: PDF to Excel Extractor")
-st.write("Upload courier invoices (DHL, FedEx, etc.). The AI will extract the data into a clean Excel file.")
 
-if not api_token:
-    st.warning("⚠️ No API Key found in Render Environment Variables (GEMINI_API_KEY).")
+# 🚨 THE OVERRIDE BOX 🚨
+st.info("💡 **Debugging Mode:** If Render is failing, paste your API key in the box below to force it to work for this session.")
+manual_key = st.text_input("Paste Google API Key", type="password")
+
+# Decide which key to use
+active_key = manual_key if manual_key else env_token
+
+if not active_key:
+    st.error("⚠️ No API Key provided! Please enter one above or check your Render environment variables.")
 
 uploaded_files = st.file_uploader("Upload Courier Invoices (PDF)", type=['pdf', 'png', 'jpg'], accept_multiple_files=True)
 
 # --- 3. PROCESSING ---
-if st.button("Extract to Excel", type="primary") and uploaded_files:
+if st.button("Extract to Excel", type="primary") and uploaded_files and active_key:
     all_shipments = []
     reconciliation_log = []
-    
     progress_bar = st.progress(0)
     
     # Setup Direct API URL
     base_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
     headers = {"Content-Type": "application/json"}
     
-    if api_token.startswith("AQ.") or api_token.startswith("ya29."):
-        headers["Authorization"] = f"Bearer {api_token}"
-        url = base_url
-    else:
-        url = f"{base_url}?key={api_token}"
+    # Send the key correctly as a standard API Key query parameter
+    url = f"{base_url}?key={active_key}"
 
     for idx, file in enumerate(uploaded_files):
         with st.spinner(f"Reading {file.name}..."):
@@ -91,7 +94,7 @@ if st.button("Extract to Excel", type="primary") and uploaded_files:
                         ]
                     }],
                     "generationConfig": {
-                        "responseMimeType": "application/json" # Forces raw JSON output
+                        "responseMimeType": "application/json" 
                     },
                     "safetySettings": [
                         {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
@@ -104,17 +107,20 @@ if st.button("Extract to Excel", type="primary") and uploaded_files:
                 # 3. Request Google API
                 response = requests.post(url, headers=headers, json=payload)
                 
+                # 🚨 ERROR TRANSLATOR 🚨
                 if response.status_code != 200:
-                    st.error(f"🛑 API Error on {file.name} [{response.status_code}]")
-                    st.code(response.text)
+                    st.error(f"🛑 Google API Error [{response.status_code}] on {file.name}")
+                    try:
+                        error_details = response.json()
+                        st.warning(f"**Google says:** {error_details['error']['message']}")
+                    except:
+                        st.code(response.text)
                     continue
                     
                 resp_data = response.json()
                 
-                # 4. Handle safety blocks natively
                 if 'candidates' not in resp_data or not resp_data['candidates']:
                     st.error(f"🛑 Google blocked {file.name} (Likely due to privacy filters on an address).")
-                    st.write(resp_data)
                     continue
                     
                 # 5. Extract and clean JSON
@@ -149,7 +155,6 @@ if st.button("Extract to Excel", type="primary") and uploaded_files:
                     'diff': abs(file_net_total - file_extracted_sum)
                 })
                 
-                # Pause to prevent rate limits
                 if idx < len(uploaded_files) - 1:
                     time.sleep(3)
                     
@@ -189,5 +194,3 @@ if st.button("Extract to Excel", type="primary") and uploaded_files:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary"
         )
-    else:
-        st.warning("No data was extracted. Please check the error messages above.")
