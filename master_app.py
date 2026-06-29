@@ -1,18 +1,17 @@
 import streamlit as st
-import google.generativeai as genai
 import pandas as pd
 import json
 import os
+import base64
+import requests
 
 # --- 1. SETUP ---
 st.set_page_config(page_title="PDF Reader V1", layout="wide")
 
-# Standard Authentication setup
+# Get the token from Render environment
 api_token = os.environ.get("GEMINI_API_KEY", "").strip()
-genai.configure(api_key=api_token)
-model = genai.GenerativeModel('gemini-1.5-flash')
 
-# Helper to clean currency strings into numbers (e.g. "1.234,56 €" -> 1234.56)
+# Helper to clean currency strings into math numbers (e.g. "1.234,56 €" -> 1234.56)
 def clean_cost(val):
     try:
         val = str(val).replace('€', '').replace(' ', '').replace('\xa0', '').strip()
@@ -28,17 +27,32 @@ def clean_cost(val):
         return 0.0
 
 # --- 2. USER INTERFACE ---
-st.title("Step 1: Minimal PDF Invoice Reader")
+st.title("Step 1: Direct API PDF Reader")
 
-if api_token.startswith("AQ."):
-    st.error("⚠️ You are using an AQ Session Token. If this fails, the token has expired. Please get a permanent AIza key from Google AI Studio.")
+if not api_token:
+    st.warning("⚠️ No API Key found. Please add GEMINI_API_KEY to your Render environment variables.")
+elif api_token.startswith("AQ."):
+    st.info("ℹ️ Using an AQ Session Token. If you get a 401/403 error, your token has expired (they last 60 mins). Generate a fresh one and update Render.")
 
 uploaded_file = st.file_uploader("Upload ONE Courier Invoice (PDF)", type=['pdf'])
 
-# --- 3. PROCESSING ---
+# --- 3. CORE PROCESSING ---
 if st.button("Process Invoice") and uploaded_file:
-    with st.spinner("AI is reading the PDF line by line..."):
+    with st.spinner("Talking directly to Google's servers..."):
         try:
+            # 1. Convert PDF to Base64 (Safe for transit)
+            pdf_bytes = uploaded_file.getvalue()
+            b64_pdf = base64.b64encode(pdf_bytes).decode('utf-8')
+            
+            # 2. Setup the Direct HTTP Request (Bypassing the buggy python library)
+            url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+            headers = {"Content-Type": "application/json"}
+            
+            if api_token.startswith("AQ.") or api_token.startswith("ya29."):
+                headers["Authorization"] = f"Bearer {api_token}"
+            else:
+                url = f"{url}?key={api_token}"
+                
             prompt = """
             Analyze this shipping invoice. Extract every shipment line.
             For each shipment, extract:
@@ -48,35 +62,43 @@ if st.button("Process Invoice") and uploaded_file:
             
             Also, find the total NET invoice amount at the bottom of the document (exclude VAT/DDV).
             
-            Return ONLY a JSON object. No markdown, no text, just this exact structure:
+            Return ONLY a JSON object. No formatting, no markdown, just this exact structure:
             {
               "invoice_net_total": 123.45,
               "shipments": [
-                {"tracking_nr": "12345", "country": "DE", "cost": 10.50},
-                {"tracking_nr": "67890", "country": "IT", "cost": 15.00}
+                {"tracking_nr": "12345", "country": "DE", "cost": 10.50}
               ]
             }
             """
             
-            # Send file to Gemini
-            fb = uploaded_file.getvalue()
-            response = model.generate_content([prompt, {"mime_type": "application/pdf", "data": fb}])
+            payload = {
+                "contents": [{
+                    "parts": [
+                        {"text": prompt},
+                        {"inlineData": {"mimeType": "application/pdf", "data": b64_pdf}}
+                    ]
+                }],
+                "generationConfig": {
+                    "responseMimeType": "application/json" # Forces Google to return raw JSON
+                }
+            }
             
-            # --- SAFEST JSON PARSING (No Regex Syntax Errors) ---
-            raw_text = response.text.strip()
+            # 3. Fire the request
+            response = requests.post(url, headers=headers, json=payload)
             
-            # Find the very first { and the very last } to perfectly grab the data
-            start_index = raw_text.find('{')
-            end_index = raw_text.rfind('}')
-            
-            if start_index != -1 and end_index != -1:
-                raw_text = raw_text[start_index:end_index+1]
+            # 4. Check for Google Errors (like expired tokens)
+            if response.status_code != 200:
+                st.error(f"🛑 Google API Error [{response.status_code}]")
+                st.code(response.text)
+                st.stop()
                 
+            # 5. Extract data
+            resp_data = response.json()
+            raw_text = resp_data['candidates'][0]['content']['parts'][0]['text']
             data = json.loads(raw_text)
             
-            # --- CALCULATE THE MATH ---
+            # 6. Do the Math
             pdf_net_total = clean_cost(data.get('invoice_net_total', 0))
-            
             shipments = []
             calculated_sum = 0.0
             
@@ -91,7 +113,7 @@ if st.button("Process Invoice") and uploaded_file:
                 
             df = pd.DataFrame(shipments)
             
-            # --- SHOW RESULTS ON SCREEN ---
+            # --- 4. SHOW RESULTS ON SCREEN ---
             st.success("PDF processed successfully!")
             
             col1, col2 = st.columns(2)
@@ -107,7 +129,7 @@ if st.button("Process Invoice") and uploaded_file:
                 st.write(f"**Invoice Net Total (Bottom of PDF):** €{pdf_net_total:,.2f}")
                 st.write(f"**Sum of Extracted Rows:** €{calculated_sum:,.2f}")
                 
-                if diff <= 1.00: # 1 euro tolerance for rounding discrepancies
+                if diff <= 1.00: 
                     st.success(f"✅ Math Matches! Discrepancy: €{diff:,.2f}")
                 else:
                     st.error(f"⚠️ Math DOES NOT match! Discrepancy: €{diff:,.2f}")
@@ -117,4 +139,4 @@ if st.button("Process Invoice") and uploaded_file:
                 st.dataframe(country_summary, use_container_width=True)
 
         except Exception as e:
-            st.error(f"🛑 Error processing PDF: {str(e)}")
+            st.error(f"🛑 Application Error: {str(e)}")
